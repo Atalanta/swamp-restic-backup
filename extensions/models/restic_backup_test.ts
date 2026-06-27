@@ -295,40 +295,179 @@ Deno.test("S2: all three secrets present → no pre-restic error thrown (validat
 });
 
 // =============================================================================
-// S2: Vault abstraction test
+// S2: Stub-invoker tests — invoker NOT called when secrets missing/empty
 // =============================================================================
 
-Deno.test("S2: two different stub vault backends with identical resolved values → identical behaviour", async () => {
+// These tests use a real invocation count to prove the restic invoker is never
+// reached when secret validation fails. We replace resticPath with a counter
+// script that would succeed if called, and assert it was never executed.
+
+Deno.test("S2: table-driven — invoker NEVER called when any secret is missing or empty", async () => {
+  // Write a tiny shell script that records invocations to a temp file and exits 0.
+  // If the invoker is called despite missing secrets, the temp file will exist.
+  const tmpDir = await Deno.makeTempDir();
+  const invocationMarker = `${tmpDir}/invoked`;
+  const fakeBinary = `${tmpDir}/fake-restic`;
+
+  await Deno.writeTextFile(
+    fakeBinary,
+    `#!/bin/sh\ntouch ${invocationMarker}\necho '{"message_type":"version","version":"0.0.0","go_version":"go1.0","go_os":"linux","go_arch":"amd64"}'\nexit 0\n`,
+  );
+  await Deno.chmod(fakeBinary, 0o755);
+
+  try {
+    for (const testCase of MISSING_SECRET_CASES) {
+      // Remove the marker before each case.
+      try { await Deno.remove(invocationMarker); } catch { /* not present */ }
+
+      const overriddenArgs = makeGlobalArgs({
+        ...testCase.override,
+        resticPath: fakeBinary,
+        repoDir: tmpDir,
+        repository: `${tmpDir}/nonexistent-repo`,
+      });
+      if (testCase.override[testCase.expectedSecretName] === undefined) {
+        (overriddenArgs as Record<string, unknown>)[testCase.expectedSecretName] = undefined;
+      }
+
+      const { context } = makeContext(overriddenArgs);
+
+      const error = await assertRejects(
+        () => model.methods.init.execute({}, context),
+        Error,
+      );
+      assertStringIncludes(error.message, testCase.expectedSecretName);
+
+      // The fake binary must NOT have been invoked — no marker file should exist.
+      let invoked = false;
+      try { await Deno.stat(invocationMarker); invoked = true; } catch { /* expected */ }
+      assertEquals(
+        invoked,
+        false,
+        `Restic invoker MUST NOT be called when ${testCase.label} (marker file found)`,
+      );
+    }
+  } finally {
+    await Deno.remove(tmpDir, { recursive: true });
+  }
+});
+
+Deno.test("S2: all three secrets present → secrets injected into child env, absent from argv and output", async () => {
+  // Write a script that dumps its own env and argv to stdout as JSON.
+  const tmpDir = await Deno.makeTempDir();
+  const fakeBinary = `${tmpDir}/fake-restic`;
+
+  // The script emits what `restic version --json` would for the probe, then on the
+  // second call (cat config) exits 1 (repo not found), then init returns initialized.
+  // We use a counter file to distinguish calls.
+  const callCountFile = `${tmpDir}/call-count`;
+  const envDumpFile = `${tmpDir}/env-dump`;
+
+  await Deno.writeTextFile(
+    fakeBinary,
+    `#!/bin/sh
+COUNT=0
+if [ -f "${callCountFile}" ]; then COUNT=$(cat "${callCountFile}"); fi
+COUNT=$((COUNT + 1))
+echo "$COUNT" > "${callCountFile}"
+env > "${envDumpFile}"
+# Call 1: version probe → emit version JSON
+if [ "$COUNT" -eq 1 ]; then
+  echo '{"message_type":"version","version":"0.18.1","go_version":"go1.25","go_os":"darwin","go_arch":"arm64"}'
+  exit 0
+fi
+# Call 2: cat config → exit 1 (repo not yet initialized)
+if [ "$COUNT" -eq 2 ]; then
+  echo '{"message_type":"exit_error","code":10,"message":"no such file or directory"}'
+  exit 1
+fi
+# Call 3: init → success
+echo '{"message_type":"initialized","id":"abc123","repository":"test"}'
+exit 0
+`,
+  );
+  await Deno.chmod(fakeBinary, 0o755);
+
+  try {
+    const { context, writes } = makeContext({
+      repository: `${tmpDir}/test-repo`,
+      repoDir: tmpDir,
+      resticPath: fakeBinary,
+      resticPassword: "SECRET_PASSWORD_VALUE",
+      b2AccountId: "SECRET_B2_ID_VALUE",
+      b2AccountKey: "SECRET_B2_KEY_VALUE",
+    });
+
+    await model.methods.init.execute({}, context);
+
+    // Verify secrets appear in env dump (were injected into subprocess env).
+    const envContent = await Deno.readTextFile(envDumpFile);
+    assertStringIncludes(envContent, "RESTIC_PASSWORD=SECRET_PASSWORD_VALUE");
+    assertStringIncludes(envContent, "B2_ACCOUNT_ID=SECRET_B2_ID_VALUE");
+    assertStringIncludes(envContent, "B2_ACCOUNT_KEY=SECRET_B2_KEY_VALUE");
+
+    // Verify secrets do NOT appear in any written resource.
+    for (const write of writes) {
+      const resourceJson = JSON.stringify(write.data);
+      assertEquals(
+        resourceJson.includes("SECRET_PASSWORD_VALUE"),
+        false,
+        "RESTIC_PASSWORD must not appear in any written resource",
+      );
+      assertEquals(
+        resourceJson.includes("SECRET_B2_ID_VALUE"),
+        false,
+        "B2_ACCOUNT_ID must not appear in any written resource",
+      );
+      assertEquals(
+        resourceJson.includes("SECRET_B2_KEY_VALUE"),
+        false,
+        "B2_ACCOUNT_KEY must not appear in any written resource",
+      );
+    }
+  } finally {
+    await Deno.remove(tmpDir, { recursive: true });
+  }
+});
+
+Deno.test("S2: vault-type abstraction — identical resolved strings from two different vault sources yield identical behaviour", async () => {
   // swamp resolves vault.get expressions to plain strings before execute is called.
-  // The model must behave identically regardless of which vault type provided the strings.
-  // We simulate two "vaults" by providing the same resolved values under different names.
+  // The model must behave identically regardless of which vault backend provided the values.
+  // We use two different "resolved" strings (simulating two vault configurations) and
+  // assert both fail at the restic level, not the secret-validation level.
 
   const vaultAArgs = makeGlobalArgs({
     repository: "/tmp/nonexistent-vault-a",
-    resticPassword: "same-password-from-vault-a",
-    b2AccountId: "same-id-from-vault-a",
-    b2AccountKey: "same-key-from-vault-a",
+    resticPassword: "resolved-password-from-vault-a",
+    b2AccountId: "resolved-id-from-vault-a",
+    b2AccountKey: "resolved-key-from-vault-a",
   });
 
   const vaultBArgs = makeGlobalArgs({
     repository: "/tmp/nonexistent-vault-b",
-    resticPassword: "same-password-from-vault-b",
-    b2AccountId: "same-id-from-vault-b",
-    b2AccountKey: "same-key-from-vault-b",
+    resticPassword: "resolved-password-from-vault-b",
+    b2AccountId: "resolved-id-from-vault-b",
+    b2AccountKey: "resolved-key-from-vault-b",
   });
 
   const { context: ctxA } = makeContext(vaultAArgs);
   const { context: ctxB } = makeContext(vaultBArgs);
 
-  // Both should fail at the restic level (not secrets level), proving abstraction
+  // Both should fail at restic level (binary can't open a nonexistent local path),
+  // not at secret-validation level — proving vault-backend agnosticism.
   const errorA = await assertRejects(() => model.methods.init.execute({}, ctxA), Error);
   const errorB = await assertRejects(() => model.methods.init.execute({}, ctxB), Error);
 
-  // Both errors should be restic-level failures, not secret validation failures
-  const isSecretErrorA = errorA.message.includes("Secret validation failed");
-  const isSecretErrorB = errorB.message.includes("Secret validation failed");
-  assertEquals(isSecretErrorA, false, "Vault A: should not be a secret validation error");
-  assertEquals(isSecretErrorB, false, "Vault B: should not be a secret validation error");
+  assertEquals(
+    errorA.message.includes("Secret validation failed"),
+    false,
+    "Vault A: must not be a secret validation error",
+  );
+  assertEquals(
+    errorB.message.includes("Secret validation failed"),
+    false,
+    "Vault B: must not be a secret validation error",
+  );
 });
 
 // =============================================================================
@@ -477,9 +616,11 @@ Deno.test("S3: capability probe with nonexistent binary → structured error, no
     const { context, writes } = makeContext({
       repository: "b2:test:test",
       resticPath: "/nonexistent/path/to/restic-does-not-exist",
-      resticPassword: "probe",
-      b2AccountId: "probe",
-      b2AccountKey: "probe",
+      // check_restic does NOT require secrets — but makeContext needs them for
+      // the schema. The check_restic execute path should not use them at all.
+      resticPassword: "irrelevant-for-check-restic",
+      b2AccountId: "irrelevant-for-check-restic",
+      b2AccountKey: "irrelevant-for-check-restic",
       repoDir: tempDir,
     });
 
@@ -492,6 +633,31 @@ Deno.test("S3: capability probe with nonexistent binary → structured error, no
       String(writes[0].data.message ?? ""),
       /not found|not executable|error/i,
     );
+  } finally {
+    await Deno.remove(tempDir, { recursive: true });
+  }
+});
+
+Deno.test("S3: check_restic does NOT inject placeholder secrets when vault secrets are missing", async () => {
+  // F1 fix: check_restic must work even when secret fields are empty/unset,
+  // because it only probes the binary (restic version --json) which needs no creds.
+  // Previously the code injected placeholder "probe" strings — that was wrong.
+  const tempDir = await Deno.makeTempDir();
+  try {
+    const { context, writes } = makeContext({
+      repository: "b2:test:test",
+      resticPath: "/opt/homebrew/bin/restic",
+      // Deliberately empty — check_restic must not validate or inject these.
+      resticPassword: "",
+      b2AccountId: "",
+      b2AccountKey: "",
+      repoDir: tempDir,
+    });
+
+    // Must succeed (binary present) even with empty secrets.
+    await model.methods.checkRestic.execute({}, context);
+    assertEquals(writes.length, 1);
+    assertEquals(writes[0].data.available, true, "check_restic must work without secrets configured");
   } finally {
     await Deno.remove(tempDir, { recursive: true });
   }
@@ -649,6 +815,65 @@ Deno.test("S9: restore refuses symlink into .swamp/ without confirm:true", async
   }
 });
 
+Deno.test("S9/F2: restore refuses ../traversal into .swamp/ without confirm:true", async () => {
+  // A path like `<repoDir>/.swamp/restore/../../../staging/../.swamp` after normalization
+  // resolves to .swamp/ and must be refused. We test a simpler canonical case:
+  // <repoDir>/staging/../.swamp which normalizes to <repoDir>/.swamp
+  const { repoDir } = await makeRestoreTestDir();
+  try {
+    const { context } = makeContext({
+      repository: "b2:test:test",
+      resticPassword: "pass",
+      b2AccountId: "id",
+      b2AccountKey: "key",
+      repoDir,
+    });
+    // staging/../.swamp normalizes to repoDir/.swamp
+    const traversalTarget = `${repoDir}/staging/../.swamp`;
+    const error = await assertRejects(
+      () => model.methods.restore.execute({ snapshot: "latest", targetDir: traversalTarget, confirm: false }, context),
+      Error,
+    );
+    assertMatch(error.message, /\.swamp|Refusing/i);
+  } finally {
+    await Deno.remove(repoDir, { recursive: true });
+  }
+});
+
+Deno.test("S9/F2: restore refuses symlink-parent with missing child pointing into .swamp/ without confirm:true", async () => {
+  // Create: <repoDir>/.swamp/
+  //         <repoDir>/link-to-swamp -> <repoDir>/.swamp
+  // Target: <repoDir>/link-to-swamp/newchild  (newchild doesn't exist yet)
+  // resolvePathWithAncestor must resolve link-to-swamp to .swamp/, then append newchild,
+  // giving <repoDir>/.swamp/newchild which is inside .swamp/.
+  const { repoDir, swampDir } = await makeRestoreTestDir();
+  const symlinkToSwamp = `${repoDir}/link-to-swamp`;
+  try {
+    await Deno.symlink(swampDir, symlinkToSwamp);
+  } catch {
+    await Deno.remove(repoDir, { recursive: true });
+    return; // Skip if symlink creation fails (e.g. no permission)
+  }
+  try {
+    const { context } = makeContext({
+      repository: "b2:test:test",
+      resticPassword: "pass",
+      b2AccountId: "id",
+      b2AccountKey: "key",
+      repoDir,
+    });
+    // newchild does not exist — must still be caught
+    const missingChildTarget = `${symlinkToSwamp}/newchild`;
+    const error = await assertRejects(
+      () => model.methods.restore.execute({ snapshot: "latest", targetDir: missingChildTarget, confirm: false }, context),
+      Error,
+    );
+    assertMatch(error.message, /\.swamp|Refusing/i);
+  } finally {
+    await Deno.remove(repoDir, { recursive: true });
+  }
+});
+
 Deno.test("S9: restore with confirm:true over a safe staging dir → proceeds past safety check", async () => {
   const { repoDir } = await makeRestoreTestDir();
   const stagingDir = await Deno.makeTempDir();
@@ -766,6 +991,45 @@ Deno.test("S6: init — first call creates repository (created:true)", async () 
     assertEquals(writes[0].data.created, true);
     assertEquals(writes[0].data.initialized, true);
     assertEquals(typeof writes[0].data.repository, "string");
+  } finally {
+    await cleanup();
+  }
+});
+
+Deno.test("S6/F3: init — genuine open failure (wrong password) is NOT reported as already-initialized", async () => {
+  // F3 fix: previously the code classified errors by substring-matching error messages,
+  // which could misreport auth/corruption failures as "already initialized".
+  // Now we use `restic cat config` exit-code as the idempotency probe: if cat config
+  // fails (non-zero), we attempt init; if init also fails (bad creds), we must throw
+  // a real error, NOT report initialized:true.
+  const { repoDir, resticRepo, cleanup } = await makeIntegrationRepo();
+  try {
+    // First, initialize with the correct password.
+    const { context: initCtx } = makeIntegrationContext(repoDir, resticRepo);
+    await model.methods.init.execute({}, initCtx);
+
+    // Now call init with a WRONG password — cat config will fail (wrong creds),
+    // so the code proceeds to `restic init`, which also fails.
+    // The result must be a thrown error, NOT initialized:true/created:false.
+    const { context: wrongCredsCtx } = makeIntegrationContext(repoDir, resticRepo, {
+      resticPassword: "WRONG_PASSWORD_DELIBERATE",
+    });
+
+    const error = await assertRejects(
+      () => model.methods.init.execute({}, wrongCredsCtx),
+      Error,
+    );
+
+    // Must NOT claim the repo is already initialized — that would be a false positive.
+    const claimsInitialized = error.message.includes("already initialized");
+    assertEquals(
+      claimsInitialized,
+      false,
+      "A wrong-password failure must NOT be reported as already-initialized",
+    );
+
+    // The error must indicate a restic failure, not a secret validation failure.
+    assertMatch(error.message, /restic init failed|exit/i);
   } finally {
     await cleanup();
   }

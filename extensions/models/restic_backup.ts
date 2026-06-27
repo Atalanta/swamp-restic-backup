@@ -155,17 +155,26 @@ const GlobalArgsSchema = z.object({
   resticPath: z.string().default("restic").describe(
     "Path to the restic binary",
   ),
-  // Vault references — CEL vault.get expressions resolved by swamp at runtime.
-  // These fields receive the RESOLVED secret values at execution time; the
-  // vault.get expression syntax is the user-facing interface only.
+  // Vault references — set these to CEL vault.get() expressions in your swamp
+  // definition. swamp resolves them at runtime before calling execute, so the
+  // model receives plain resolved strings. The vault backend (local encrypted,
+  // AWS Secrets Manager, 1Password, etc.) is abstracted by swamp; the model
+  // is agnostic because it only sees resolved strings.
+  //
+  // Example (B2 credentials stored in a vault named "backup-vault"):
+  //   resticPassword: vault.get('backup-vault', 'restic_password')
+  //   b2AccountId:    vault.get('backup-vault', 'b2_account_id')
+  //   b2AccountKey:   vault.get('backup-vault', 'b2_account_key')
+  //
+  // Missing or empty values cause a structured error before restic is called.
   resticPassword: z.string().describe(
-    "vault.get expression for RESTIC_PASSWORD (e.g. vault.get('my-vault', 'restic_password'))",
+    "MUST be a vault.get('vault-name','key') CEL expression — swamp resolves this to RESTIC_PASSWORD at runtime. Example: vault.get('backup-vault','restic_password')",
   ),
   b2AccountId: z.string().describe(
-    "vault.get expression for B2_ACCOUNT_ID (e.g. vault.get('my-vault', 'b2_account_id'))",
+    "MUST be a vault.get('vault-name','key') CEL expression — swamp resolves this to B2_ACCOUNT_ID at runtime. Example: vault.get('backup-vault','b2_account_id')",
   ),
   b2AccountKey: z.string().describe(
-    "vault.get expression for B2_ACCOUNT_KEY (e.g. vault.get('my-vault', 'b2_account_key'))",
+    "MUST be a vault.get('vault-name','key') CEL expression — swamp resolves this to B2_ACCOUNT_KEY at runtime. Example: vault.get('backup-vault','b2_account_key')",
   ),
 });
 
@@ -287,29 +296,45 @@ function extractSecrets(globalArgs: z.infer<typeof GlobalArgsSchema>): ResticSec
   };
 }
 
+/**
+ * Defensively replace all occurrences of known secret values in a string with
+ * the placeholder "[REDACTED]". Used before persisting any subprocess output to
+ * the resource store. Belt-and-suspenders: restic reads secrets from env and
+ * should never echo them back, but this guards against unexpected reflection in
+ * diagnostic or error output.
+ */
+function redactSecrets(text: string, secrets: ResticSecrets): string {
+  let redacted = text;
+  // Replace each secret value; skip empty strings to avoid corrupting all output.
+  if (secrets.resticPassword) {
+    redacted = redacted.replaceAll(secrets.resticPassword, "[REDACTED]");
+  }
+  if (secrets.b2AccountId) {
+    redacted = redacted.replaceAll(secrets.b2AccountId, "[REDACTED]");
+  }
+  if (secrets.b2AccountKey) {
+    redacted = redacted.replaceAll(secrets.b2AccountKey, "[REDACTED]");
+  }
+  return redacted;
+}
+
 // =============================================================================
 // Restic Invoker
 // =============================================================================
 
 /**
- * Invoke a restic command with --json always present in argv.
- * Secrets are injected ONLY via subprocess env (RESTIC_PASSWORD, B2_ACCOUNT_ID,
- * B2_ACCOUNT_KEY) — never as argv or in any logged output.
+ * Invoke a restic command.
+ * argv[0] is the binary; all subsequent elements are arguments.
+ * env overrides the full subprocess environment — callers must supply the
+ * complete env they want (see invokeRestic and invokeResticNoSecrets below).
  * Returns the raw stdout/stderr/exitCode without parsing.
  */
-async function invokeRestic(
+async function spawnRestic(
   argv: string[],
-  secrets: ResticSecrets,
+  env: Record<string, string>,
   cwd: string,
 ): Promise<ResticResult> {
   const startTime = performance.now();
-
-  // Build subprocess env: inherit current env but inject secrets and remove
-  // any pre-existing RESTIC_PASSWORD/B2_* to prevent accidental leakage
-  const subprocessEnv: Record<string, string> = { ...Deno.env.toObject() };
-  subprocessEnv["RESTIC_PASSWORD"] = secrets.resticPassword;
-  subprocessEnv["B2_ACCOUNT_ID"] = secrets.b2AccountId;
-  subprocessEnv["B2_ACCOUNT_KEY"] = secrets.b2AccountKey;
 
   const command = new Deno.Command(argv[0], {
     args: argv.slice(1),
@@ -317,13 +342,11 @@ async function invokeRestic(
     stderr: "piped",
     stdin: "null",
     cwd,
-    env: subprocessEnv,
+    env,
   });
 
   // Deno.Command.output() throws a NotFound error when the binary doesn't exist.
-  // We catch it here and return a structured failure so callers (especially
-  // probeResticCapability) can surface a clean "binary not found" message
-  // rather than an unhandled exception.
+  // Catch and return a structured failure so callers can surface a clean message.
   let output: Deno.CommandOutput;
   try {
     output = await command.output();
@@ -350,6 +373,40 @@ async function invokeRestic(
     success: output.success,
     durationMs,
   };
+}
+
+/**
+ * Invoke a restic command that requires repo access.
+ * Secrets are injected ONLY via subprocess env (RESTIC_PASSWORD, B2_ACCOUNT_ID,
+ * B2_ACCOUNT_KEY) — never as argv or in any logged output.
+ * Must only be called AFTER validateSecrets returns null.
+ */
+async function invokeRestic(
+  argv: string[],
+  secrets: ResticSecrets,
+  cwd: string,
+): Promise<ResticResult> {
+  // Build subprocess env: inherit current env then inject secrets, overwriting
+  // any pre-existing RESTIC_PASSWORD/B2_* values to prevent ambient leakage.
+  const subprocessEnv: Record<string, string> = { ...Deno.env.toObject() };
+  subprocessEnv["RESTIC_PASSWORD"] = secrets.resticPassword;
+  subprocessEnv["B2_ACCOUNT_ID"] = secrets.b2AccountId;
+  subprocessEnv["B2_ACCOUNT_KEY"] = secrets.b2AccountKey;
+  return spawnRestic(argv, subprocessEnv, cwd);
+}
+
+/**
+ * Invoke a restic command that does NOT touch the repository (e.g. `restic version`).
+ * No secrets are injected. Used by the capability probe so that check_restic can
+ * verify binary presence without requiring vault secrets to be configured.
+ */
+async function invokeResticNoSecrets(
+  argv: string[],
+  cwd: string,
+): Promise<ResticResult> {
+  // Inherit the ambient env without adding any secret keys.
+  const subprocessEnv: Record<string, string> = { ...Deno.env.toObject() };
+  return spawnRestic(argv, subprocessEnv, cwd);
 }
 
 // =============================================================================
@@ -406,24 +463,27 @@ function findJsonlMessage(
 // =============================================================================
 
 /**
- * Verify that the installed restic binary supports --json for all required commands.
- * This is a structural check: if it fails, all operational methods must refuse to run.
- * restic 0.17+ supports --json for all required commands; this probe verifies
- * the binary is present and responsive.
+ * Probe whether the restic binary is present and supports `--json` output.
+ *
+ * This checks only what it can verify without touching the repository: it runs
+ * `restic version --json` (no repo credentials needed) and confirms the output
+ * is valid JSON with message_type="version". It does NOT verify every command's
+ * --json behaviour individually — that is guaranteed by restic >= 0.9.6 for all
+ * commands this model uses. The probe is a structural binary-present + JSON-capable
+ * check; if it fails, all operational methods refuse to run.
+ *
+ * No secrets are injected — `restic version` requires no repo access.
  */
 async function probeResticCapability(
   resticPath: string,
-  secrets: ResticSecrets,
   cwd: string,
 ): Promise<{ supported: boolean; version: string | null; message: string }> {
-  const result = await invokeRestic(
+  const result = await invokeResticNoSecrets(
     [resticPath, "version", "--json"],
-    secrets,
     cwd,
   );
 
   if (!result.success && result.exitCode !== 0) {
-    // Check if the binary exists at all
     return {
       supported: false,
       version: null,
@@ -437,19 +497,19 @@ async function probeResticCapability(
       return {
         supported: false,
         version: null,
-        message: `restic version output did not include --json support (message_type='${parsed["message_type"]}', expected 'version')`,
+        message: `restic version --json did not emit message_type="version" (got '${parsed["message_type"]}') — binary may not support --json`,
       };
     }
     return {
       supported: true,
       version: (parsed["version"] as string) ?? null,
-      message: `restic ${parsed["version"]} is available with --json support`,
+      message: `restic ${parsed["version"]} detected; --json output confirmed`,
     };
   } catch (parseError) {
     return {
       supported: false,
       version: null,
-      message: `restic version --json did not emit valid JSON (no --json support?): ${String(parseError)}`,
+      message: `restic version --json did not emit valid JSON — binary may not support --json: ${String(parseError)}`,
     };
   }
 }
@@ -459,6 +519,90 @@ async function probeResticCapability(
 // =============================================================================
 
 /**
+ * Normalize an absolute path by collapsing `.` and `..` segments without
+ * touching the filesystem. This is a pure string operation applied BEFORE
+ * any existence checks, ensuring that paths like `/a/b/../.swamp` are
+ * collapsed to `/a/.swamp` even when `/a/b` does not exist.
+ */
+function normalizePosixPath(absPath: string): string {
+  const segments = absPath.split("/");
+  const normalized: string[] = [];
+  for (const segment of segments) {
+    if (segment === "" || segment === ".") {
+      // Skip empty and current-dir segments; preserve leading empty for root.
+      if (normalized.length === 0) normalized.push("");
+      continue;
+    }
+    if (segment === "..") {
+      // Pop the last real segment, but never go above root.
+      if (normalized.length > 1) normalized.pop();
+      continue;
+    }
+    normalized.push(segment);
+  }
+  return normalized.join("/") || "/";
+}
+
+/**
+ * Resolve a path to its real, symlink-normalized absolute path even when the
+ * target doesn't fully exist yet.
+ *
+ * Algorithm:
+ *   1. Make the path absolute.
+ *   2. Collapse all `.` and `..` segments via string normalization first — this
+ *      handles traversal attacks even for non-existent paths.
+ *   3. Try Deno.realPath on the normalized path (handles symlinks if it exists).
+ *   4. If that fails, walk up the normalized path to find the deepest existing
+ *      ancestor, resolve that via Deno.realPath (handles symlinks in the
+ *      existing portion), then re-append the non-existing tail.
+ *
+ * This prevents both `../` traversal and symlink-parent-with-missing-child
+ * bypasses of the safety checker.
+ */
+async function resolvePathWithAncestor(rawPath: string, cwd: string): Promise<string> {
+  // Make the path absolute and collapse all `.` / `..` segments.
+  const absPath = rawPath.startsWith("/") ? rawPath : `${cwd}/${rawPath}`;
+  const normalizedPath = normalizePosixPath(absPath);
+
+  // Try the full normalized path first (common case: target already exists).
+  try {
+    return await Deno.realPath(normalizedPath);
+  } catch { /* target doesn't exist — walk up */ }
+
+  // Split the already-normalized path into segments.
+  const segments = normalizedPath.split("/").filter((s) => s !== "");
+  let existingAncestor = "/";
+  let lastExistingIndex = -1;
+
+  for (let i = 0; i < segments.length; i++) {
+    const candidate = "/" + segments.slice(0, i + 1).join("/");
+    try {
+      await Deno.lstat(candidate);
+      lastExistingIndex = i;
+      existingAncestor = candidate;
+    } catch {
+      // This segment doesn't exist — stop searching further.
+      break;
+    }
+  }
+
+  // Resolve the existing ancestor through any symlinks.
+  let resolvedAncestor: string;
+  try {
+    resolvedAncestor = await Deno.realPath(existingAncestor);
+  } catch {
+    resolvedAncestor = existingAncestor;
+  }
+
+  // Re-append the non-existing tail segments (already free of `.`/`..`).
+  const remainingSegments = segments.slice(lastExistingIndex + 1);
+  if (remainingSegments.length === 0) {
+    return resolvedAncestor;
+  }
+  return `${resolvedAncestor}/${remainingSegments.join("/")}`;
+}
+
+/**
  * Check whether a proposed restore target directory is dangerous.
  *
  * Refuses (returns an error message string) when the resolved, symlink-normalized
@@ -466,7 +610,10 @@ async function probeResticCapability(
  *   (a) equals repo root
  *   (b) equals .swamp/ within the repo
  *   (c) is an ancestor/parent containing a live .swamp/
- *   (d) resolves into .swamp/ via symlink
+ *   (d) resolves into .swamp/ via symlink (including when the final segment doesn't exist)
+ *
+ * Uses resolvePathWithAncestor to handle `../` traversal and symlink-parent-with-
+ * missing-child cases that Deno.realPath alone would miss.
  *
  * Returns null if the target is safe, or an error message string if it is dangerous.
  */
@@ -478,24 +625,9 @@ async function checkRestoreTargetSafety(
     return "targetDir is required for restore — specify an explicit directory to restore into";
   }
 
-  // Resolve both paths to their real, symlink-normalized absolute paths
-  let resolvedTarget: string;
-  let resolvedRepo: string;
-
-  try {
-    resolvedTarget = await Deno.realPath(targetDir);
-  } catch {
-    // Target doesn't exist yet — check if its ancestor is dangerous
-    // Resolve as far as we can
-    resolvedTarget = targetDir.startsWith("/") ? targetDir : `${repoDir}/${targetDir}`;
-  }
-
-  try {
-    resolvedRepo = await Deno.realPath(repoDir);
-  } catch {
-    resolvedRepo = repoDir;
-  }
-
+  // Resolve both paths fully, including through symlinks and ../  segments.
+  const resolvedTarget = await resolvePathWithAncestor(targetDir, repoDir);
+  const resolvedRepo = await resolvePathWithAncestor(repoDir, repoDir);
   const resolvedSwampDir = `${resolvedRepo}/.swamp`;
 
   // (a) equals repo root
@@ -508,13 +640,12 @@ async function checkRestoreTargetSafety(
     return `Refusing to restore into .swamp/ directly (${resolvedTarget}). Use a staging directory outside the repo.`;
   }
 
-  // (c) is an ancestor/parent that contains .swamp/ — i.e. target is a prefix of .swamp/
-  // This catches restoring to the parent of repoDir, which would clobber .swamp/
+  // (c) is an ancestor/parent that contains .swamp/ — i.e. the .swamp/ path starts with target
   if (resolvedSwampDir.startsWith(resolvedTarget + "/")) {
     return `Refusing to restore into ${resolvedTarget} — it is an ancestor of .swamp/ (${resolvedSwampDir}). Use a staging directory outside the repo.`;
   }
 
-  // (d) resolves into .swamp/ via symlink — i.e. target is inside .swamp/
+  // (d) resolves into .swamp/ (including via symlink or missing-child traversal)
   if (
     resolvedTarget.startsWith(resolvedSwampDir + "/") ||
     resolvedTarget === resolvedSwampDir
@@ -623,26 +754,11 @@ export const model = {
         const cwd = context.globalArgs.repoDir;
         const resticPath = context.globalArgs.resticPath;
 
-        // For check_restic, we create dummy secrets since we just need the
-        // binary check but invokeRestic always requires secrets. Real secrets
-        // are used when available; placeholder values are used when vault refs
-        // are not yet configured, allowing binary detection before full setup.
-        const secretError = validateSecrets(context.globalArgs);
-
-        let secrets: ResticSecrets;
-        if (secretError !== null) {
-          // Use placeholder secrets just to check the binary — these won't be
-          // used for any actual restic repo operation, just `restic version`
-          secrets = {
-            resticPassword: "probe",
-            b2AccountId: "probe",
-            b2AccountKey: "probe",
-          };
-        } else {
-          secrets = extractSecrets(context.globalArgs);
-        }
-
-        const probe = await probeResticCapability(resticPath, secrets, cwd);
+        // check_restic only probes the binary via `restic version --json`.
+        // That command requires no repository credentials, so NO secrets are
+        // injected here. This is the only method that does not validate or use
+        // secrets — it is explicitly a binary-availability check, not a repo op.
+        const probe = await probeResticCapability(resticPath, cwd);
 
         const statusData = {
           available: probe.supported,
@@ -690,22 +806,54 @@ export const model = {
         const repository = context.globalArgs.repository;
 
         // Verify --json capability before any operational call
-        const probe = await probeResticCapability(resticPath, secrets, cwd);
+        const probe = await probeResticCapability(resticPath, cwd);
         if (!probe.supported) {
           throw new Error(
             `restic does not support --json: ${probe.message}`,
           );
         }
 
+        // Idempotency probe: check whether the repository is already accessible
+        // by running `restic cat config --json` before attempting init.
+        // This gives a machine-readable yes/no answer based on exit code alone,
+        // without classifying error messages by free-form text. Exit 0 → repo
+        // exists and is openable with these credentials. Non-zero → repo does
+        // not exist OR cannot be opened (bad creds, corrupt repo, backend error).
+        // We only treat exit 0 as "already initialized"; everything else proceeds
+        // to `restic init` and lets restic itself report any real failure.
+        const catConfigResult = await invokeRestic(
+          [resticPath, "cat", "config", "--json", "--repo", repository],
+          secrets,
+          cwd,
+        );
+
+        if (catConfigResult.success) {
+          // Repository already exists and is openable — report initialized, not created.
+          const statusData = {
+            repository,
+            initialized: true,
+            created: false,
+            message: `Repository already initialized at ${repository}`,
+          };
+          const handle = await context.writeResource(
+            "repositoryStatus",
+            "current",
+            statusData as unknown as Record<string, unknown>,
+          );
+          context.logger.info(
+            "init: repository already exists, skipping init",
+            { repository },
+          );
+          return { dataHandles: [handle] };
+        }
+
+        // Repository is not yet openable — attempt to create it.
         const result = await invokeRestic(
           [resticPath, "init", "--json", "--repo", repository],
           secrets,
           cwd,
         );
 
-        // exit code 0 with message_type=initialized → newly created
-        // exit code 1 with "config file already exists" in the JSON error → already initialized
-        // Both are success states; we distinguish via --json/exit semantics, NOT human text
         let initialized = false;
         let created = false;
         let message = "";
@@ -716,38 +864,23 @@ export const model = {
             created = true;
             initialized = true;
             message = `Repository created at ${repository}`;
+          } else {
+            throw new Error(
+              `restic init --json returned unexpected message_type='${parsed["message_type"]}' (expected 'initialized')`,
+            );
           }
         } else {
-          // Check for already-initialized by looking at the exit_error JSON.
-          // restic exits 1 with a JSON exit_error when repo already exists.
-          // The JSON may appear on stdout OR stderr depending on restic version
-          // and the specific error — check both channels.
+          // init failed — surface the JSON error message if available, otherwise stderr.
+          // We do NOT classify the error by message text; all non-zero exits are failures.
           const errorJsonSource = result.stdout.trim() || result.stderr.trim();
+          let errorDetail = result.stderr.slice(0, 300);
           try {
             const errorParsed = JSON.parse(errorJsonSource) as Record<string, unknown>;
-            const errorMessage = (errorParsed["message"] as string) ?? "";
-            if (
-              errorParsed["message_type"] === "exit_error" &&
-              (errorMessage.includes("config file already exists") ||
-                errorMessage.includes("unable to open repository"))
-            ) {
-              // Already initialized — this is idempotent, not an error
-              initialized = true;
-              created = false;
-              message = `Repository already initialized at ${repository}`;
-            } else {
-              throw new Error(
-                `restic init failed (exit ${result.exitCode}): ${errorMessage || result.stderr.slice(0, 200)}`,
-              );
-            }
-          } catch (parseError) {
-            if (parseError instanceof SyntaxError) {
-              throw new Error(
-                `restic init --json did not return valid JSON (exit ${result.exitCode}): ${result.stderr.slice(0, 200)}`,
-              );
-            }
-            throw parseError;
-          }
+            errorDetail = (errorParsed["message"] as string) ?? errorDetail;
+          } catch { /* keep stderr fallback */ }
+          throw new Error(
+            `restic init failed (exit ${result.exitCode}): ${errorDetail}`,
+          );
         }
 
         const statusData = { repository, initialized, created, message };
@@ -786,7 +919,7 @@ export const model = {
         const resticPath = context.globalArgs.resticPath;
         const repository = context.globalArgs.repository;
 
-        const probe = await probeResticCapability(resticPath, secrets, cwd);
+        const probe = await probeResticCapability(resticPath, cwd);
         if (!probe.supported) {
           throw new Error(
             `restic does not support --json: ${probe.message}`,
@@ -899,7 +1032,7 @@ export const model = {
         const resticPath = context.globalArgs.resticPath;
         const repository = context.globalArgs.repository;
 
-        const probe = await probeResticCapability(resticPath, secrets, cwd);
+        const probe = await probeResticCapability(resticPath, cwd);
         if (!probe.supported) {
           throw new Error(
             `restic does not support --json: ${probe.message}`,
@@ -989,7 +1122,7 @@ export const model = {
         const resticPath = context.globalArgs.resticPath;
         const repository = context.globalArgs.repository;
 
-        const probe = await probeResticCapability(resticPath, secrets, cwd);
+        const probe = await probeResticCapability(resticPath, cwd);
         if (!probe.supported) {
           throw new Error(
             `restic does not support --json: ${probe.message}`,
@@ -1088,7 +1221,7 @@ export const model = {
         const resticPath = context.globalArgs.resticPath;
         const repository = context.globalArgs.repository;
 
-        const probe = await probeResticCapability(resticPath, secrets, cwd);
+        const probe = await probeResticCapability(resticPath, cwd);
         if (!probe.supported) {
           throw new Error(
             `restic does not support --json: ${probe.message}`,
@@ -1176,7 +1309,7 @@ export const model = {
         const resticPath = context.globalArgs.resticPath;
         const repository = context.globalArgs.repository;
 
-        const probe = await probeResticCapability(resticPath, secrets, cwd);
+        const probe = await probeResticCapability(resticPath, cwd);
         if (!probe.supported) {
           throw new Error(
             `restic does not support --json: ${probe.message}`,
@@ -1263,7 +1396,7 @@ export const model = {
         const resticPath = context.globalArgs.resticPath;
         const repository = context.globalArgs.repository;
 
-        const probe = await probeResticCapability(resticPath, secrets, cwd);
+        const probe = await probeResticCapability(resticPath, cwd);
         if (!probe.supported) {
           throw new Error(
             `restic does not support --json: ${probe.message}`,
@@ -1291,7 +1424,13 @@ export const model = {
         // they were unused and scraping human text would violate the
         // no-human-text-parser invariant. Populate from JSON once restic adds
         // prune JSON support.
-        const rawOutput = (result.stdout + result.stderr).slice(0, 2000);
+        //
+        // Defensively redact the three secret values from rawOutput even though
+        // restic reads them from env (not args) and should never echo them back.
+        // Belt-and-suspenders: any accidental secret reflection in diagnostic
+        // output must not be persisted to the resource store.
+        const rawOutputUnredacted = (result.stdout + result.stderr).slice(0, 2000);
+        const rawOutput = redactSecrets(rawOutputUnredacted, secrets);
 
         const pruneData = {
           durationMs,
