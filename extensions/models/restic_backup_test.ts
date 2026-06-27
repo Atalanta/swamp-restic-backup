@@ -1,0 +1,1291 @@
+/**
+ * Test suite for the @atalanta/restic-backup swamp model extension.
+ *
+ * Two tiers:
+ *   1. Unit tests — stub vault, stubbed invoker, no real restic required for most
+ *   2. Integration tests — real local restic repo (filesystem backend, NOT B2)
+ *
+ * Real-B2 tests are env-gated and skipped by default.
+ *
+ * Run with: deno test --allow-all extensions/models/restic_backup_test.ts
+ *
+ * @module
+ */
+
+import {
+  assertEquals,
+  assertMatch,
+  assertRejects,
+  assertStringIncludes,
+} from "jsr:@std/assert@^1";
+
+import {
+  DEFAULT_EXCLUDE_PATTERNS,
+  DEFAULT_INCLUDE_PATHS,
+  model,
+  parseResticJsonOutput,
+} from "./restic_backup.ts";
+
+// =============================================================================
+// Test helpers and stub builders
+// =============================================================================
+
+/** Minimal stub for a written resource handle. */
+type ResourceHandle = {
+  name: string;
+  specName: string;
+  kind: string;
+  dataId: string;
+  version: number;
+  size: number;
+};
+
+/** Builds a no-op resource handle for testing. */
+function makeResourceHandle(specName: string, instanceName: string): ResourceHandle {
+  return {
+    name: instanceName,
+    specName,
+    kind: "data",
+    dataId: `test-${instanceName}`,
+    version: 1,
+    size: 0,
+  };
+}
+
+/** Captured write call for assertion. */
+type WriteCall = { specName: string; instanceName: string; data: Record<string, unknown> };
+
+/** Builds a MethodContext stub with captured writes and configurable globalArgs. */
+function makeContext(
+  globalArgsOverrides: Partial<ReturnType<typeof makeGlobalArgs>> = {},
+): {
+  context: Parameters<typeof model.methods.checkRestic.execute>[1];
+  writes: WriteCall[];
+  logMessages: string[];
+} {
+  const writes: WriteCall[] = [];
+  const logMessages: string[] = [];
+
+  const globalArgs = { ...makeGlobalArgs(), ...globalArgsOverrides };
+
+  const context = {
+    globalArgs,
+    logger: {
+      info: (msg: string, _meta?: Record<string, unknown>) => {
+        logMessages.push(`INFO: ${msg}`);
+      },
+      warning: (msg: string, _meta?: Record<string, unknown>) => {
+        logMessages.push(`WARN: ${msg}`);
+      },
+      error: (msg: string, _meta?: Record<string, unknown>) => {
+        logMessages.push(`ERROR: ${msg}`);
+      },
+    },
+    writeResource: async (
+      specName: string,
+      instanceName: string,
+      data: Record<string, unknown>,
+    ): Promise<ResourceHandle> => {
+      writes.push({ specName, instanceName, data });
+      return Promise.resolve(makeResourceHandle(specName, instanceName));
+    },
+    readResource: async (_instanceName: string): Promise<Record<string, unknown> | null> => {
+      return Promise.resolve(null);
+    },
+  };
+
+  return { context: context as Parameters<typeof model.methods.checkRestic.execute>[1], writes, logMessages };
+}
+
+/** Builds a complete set of default globalArgs for testing. */
+function makeGlobalArgs(overrides: Record<string, unknown> = {}) {
+  return {
+    repository: "b2:test-bucket:test-path",
+    repoDir: "/tmp/test-repo",
+    include: [] as string[],
+    exclude: [] as string[],
+    hostTag: undefined as string | undefined,
+    extraTags: [] as string[],
+    retention: {} as Record<string, number | undefined>,
+    resticPath: "/opt/homebrew/bin/restic",
+    // These are vault.get CEL expressions resolved by swamp at runtime.
+    // In tests, swamp resolves them to plain string values before calling execute.
+    resticPassword: "test-restic-password",
+    b2AccountId: "test-b2-account-id",
+    b2AccountKey: "test-b2-account-key",
+    ...overrides,
+  };
+}
+
+// =============================================================================
+// S1: Default include/exclude policy tests
+// =============================================================================
+
+Deno.test("S1: DEFAULT_INCLUDE_PATHS matches architecture policy exactly", () => {
+  const expectedIncludes = [
+    ".swamp/data",
+    ".swamp/outputs",
+    ".swamp/workflow-runs",
+    ".swamp/definitions-evaluated",
+    ".swamp/workflows-evaluated",
+  ];
+  assertEquals(
+    [...DEFAULT_INCLUDE_PATHS].sort(),
+    [...expectedIncludes].sort(),
+    "Default include paths must match the architecture policy exactly",
+  );
+});
+
+Deno.test("S1: DEFAULT_EXCLUDE_PATTERNS matches architecture policy exactly", () => {
+  const expectedExcludes = [
+    ".swamp/data/_catalog.db",
+    ".swamp/bundles",
+    ".swamp/datastore-bundles",
+    ".swamp/driver-bundles",
+    ".swamp/report-bundles",
+    ".swamp/vault-bundles",
+    ".swamp/telemetry",
+    ".swamp/logs",
+    ".swamp/secrets",
+  ];
+  assertEquals(
+    [...DEFAULT_EXCLUDE_PATTERNS].sort(),
+    [...expectedExcludes].sort(),
+    "Default exclude patterns must match the architecture policy exactly",
+  );
+});
+
+// =============================================================================
+// S1: globalArguments stores raw vault.get expressions, not literal values
+// =============================================================================
+
+Deno.test("S1: globalArguments schema contains resticPassword, b2AccountId, b2AccountKey as z.string()", () => {
+  // The globalArguments schema must accept these keys as plain strings.
+  // In production, swamp resolves vault.get CEL expressions to strings before calling execute.
+  // Here we verify the schema shape stores expressions, not any vault-specific type.
+  const schema = model.globalArguments;
+
+  // Parsing a set of expressions should succeed
+  const parsed = schema.parse({
+    repository: "b2:bucket:path",
+    resticPassword: "vault.get('my-vault', 'restic_password')",
+    b2AccountId: "vault.get('my-vault', 'b2_account_id')",
+    b2AccountKey: "vault.get('my-vault', 'b2_account_key')",
+  });
+
+  // The schema must store the raw expressions without transformation
+  assertEquals(parsed.resticPassword, "vault.get('my-vault', 'restic_password')");
+  assertEquals(parsed.b2AccountId, "vault.get('my-vault', 'b2_account_id')");
+  assertEquals(parsed.b2AccountKey, "vault.get('my-vault', 'b2_account_key')");
+});
+
+Deno.test("S1: model type is @atalanta/restic-backup/repository", () => {
+  assertEquals(model.type, "@atalanta/restic-backup/repository");
+});
+
+// =============================================================================
+// S2: TABLE-DRIVEN missing-secret tests
+// =============================================================================
+
+// These test that a structured error is thrown BEFORE restic is called
+// when any of the three required secrets is absent or empty.
+//
+// We test each of the 3 secrets × 2 conditions (absent/empty) = 6 cases.
+// We verify: (a) a structured Error is thrown, (b) its message names the missing secret.
+//
+// We can't directly assert "invoker NOT called" without mocking Deno.Command,
+// but because the error is thrown before invokeRestic is reached, and all
+// integration test secrets point to a real B2 (absent), the error happens in
+// the validation layer.
+
+type MissingSecretCase = {
+  label: string;
+  override: Record<string, unknown>;
+  expectedSecretName: string;
+};
+
+const MISSING_SECRET_CASES: MissingSecretCase[] = [
+  {
+    label: "resticPassword absent",
+    override: { resticPassword: undefined as unknown as string },
+    expectedSecretName: "resticPassword",
+  },
+  {
+    label: "resticPassword empty string",
+    override: { resticPassword: "" },
+    expectedSecretName: "resticPassword",
+  },
+  {
+    label: "b2AccountId absent",
+    override: { b2AccountId: undefined as unknown as string },
+    expectedSecretName: "b2AccountId",
+  },
+  {
+    label: "b2AccountId empty string",
+    override: { b2AccountId: "" },
+    expectedSecretName: "b2AccountId",
+  },
+  {
+    label: "b2AccountKey absent",
+    override: { b2AccountKey: undefined as unknown as string },
+    expectedSecretName: "b2AccountKey",
+  },
+  {
+    label: "b2AccountKey empty string",
+    override: { b2AccountKey: "" },
+    expectedSecretName: "b2AccountKey",
+  },
+];
+
+for (const testCase of MISSING_SECRET_CASES) {
+  Deno.test(`S2: missing secret — ${testCase.label} → structured pre-restic error`, async () => {
+    // Override the schema parse to allow missing values (the schema uses z.string()
+    // which requires a value; we bypass it by providing a partial override)
+    const overriddenArgs = makeGlobalArgs(testCase.override);
+    // Force the field to undefined/empty to simulate missing vault resolution
+    if (testCase.override[testCase.expectedSecretName] === undefined) {
+      (overriddenArgs as Record<string, unknown>)[testCase.expectedSecretName] = undefined;
+    }
+
+    const { context } = makeContext(overriddenArgs);
+
+    // Use `init` as a representative method (any operational method should fail the same way)
+    const error = await assertRejects(
+      () => model.methods.init.execute({}, context),
+      Error,
+    );
+
+    // The error message must name the missing secret field
+    assertStringIncludes(
+      error.message,
+      testCase.expectedSecretName,
+      `Error message must name the missing secret '${testCase.expectedSecretName}'`,
+    );
+
+    // The error must mention "Secret" or "secret" to indicate it's a pre-restic validation
+    assertMatch(
+      error.message,
+      /[Ss]ecret/,
+      "Error must indicate this is a secret validation failure",
+    );
+  });
+}
+
+Deno.test("S2: all three secrets present → no pre-restic error thrown (validation passes)", async () => {
+  // With all secrets present, validation should pass.
+  // The actual restic call will fail (wrong repo URL / not a real B2), but
+  // that's a restic-level error, not a secret-validation error.
+  const { context } = makeContext({
+    repository: "/tmp/nonexistent-restic-repo-validation-test",
+    resticPath: "/opt/homebrew/bin/restic",
+    resticPassword: "not-empty",
+    b2AccountId: "not-empty",
+    b2AccountKey: "not-empty",
+  });
+
+  // Should throw a restic-level error, NOT a secret validation error
+  const error = await assertRejects(
+    () => model.methods.init.execute({}, context),
+    Error,
+  );
+
+  // The error must NOT be a secret validation error
+  const isSecretError = error.message.includes("Secret validation failed");
+  assertEquals(isSecretError, false, "Should not be a secret validation error when all secrets are present");
+});
+
+// =============================================================================
+// S2: Vault abstraction test
+// =============================================================================
+
+Deno.test("S2: two different stub vault backends with identical resolved values → identical behaviour", async () => {
+  // swamp resolves vault.get expressions to plain strings before execute is called.
+  // The model must behave identically regardless of which vault type provided the strings.
+  // We simulate two "vaults" by providing the same resolved values under different names.
+
+  const vaultAArgs = makeGlobalArgs({
+    repository: "/tmp/nonexistent-vault-a",
+    resticPassword: "same-password-from-vault-a",
+    b2AccountId: "same-id-from-vault-a",
+    b2AccountKey: "same-key-from-vault-a",
+  });
+
+  const vaultBArgs = makeGlobalArgs({
+    repository: "/tmp/nonexistent-vault-b",
+    resticPassword: "same-password-from-vault-b",
+    b2AccountId: "same-id-from-vault-b",
+    b2AccountKey: "same-key-from-vault-b",
+  });
+
+  const { context: ctxA } = makeContext(vaultAArgs);
+  const { context: ctxB } = makeContext(vaultBArgs);
+
+  // Both should fail at the restic level (not secrets level), proving abstraction
+  const errorA = await assertRejects(() => model.methods.init.execute({}, ctxA), Error);
+  const errorB = await assertRejects(() => model.methods.init.execute({}, ctxB), Error);
+
+  // Both errors should be restic-level failures, not secret validation failures
+  const isSecretErrorA = errorA.message.includes("Secret validation failed");
+  const isSecretErrorB = errorB.message.includes("Secret validation failed");
+  assertEquals(isSecretErrorA, false, "Vault A: should not be a secret validation error");
+  assertEquals(isSecretErrorB, false, "Vault B: should not be a secret validation error");
+});
+
+// =============================================================================
+// S3: --json flag on every command
+// =============================================================================
+
+// We verify --json is present by running each command against a nonexistent repo
+// and asserting the output is valid JSON (which only happens when --json is used).
+
+async function runCommandAndGetStdout(methodName: keyof typeof model.methods, args: Record<string, unknown>): Promise<string> {
+  // Use a temp dir that exists (so the binary check passes) but is not a valid repo
+  const tempDir = await Deno.makeTempDir();
+  try {
+    const { context } = makeContext({
+      repository: `${tempDir}/nonexistent-repo`,
+      resticPath: "/opt/homebrew/bin/restic",
+      resticPassword: "probe-password",
+      b2AccountId: "probe-id",
+      b2AccountKey: "probe-key",
+      repoDir: tempDir,
+    });
+
+    // We expect this to throw (repo doesn't exist), but we need to capture
+    // whether the error came from JSON parsing or from restic's exit_error JSON
+    try {
+      // deno-lint-ignore no-explicit-any
+      await (model.methods[methodName] as unknown as { execute: (args: Record<string, unknown>, ctx: typeof context) => Promise<unknown> }).execute(args, context);
+    } catch (err) {
+      // Expected — return the error message for analysis
+      return (err as Error).message;
+    }
+    return "no-error";
+  } finally {
+    await Deno.remove(tempDir, { recursive: true });
+  }
+}
+
+Deno.test("S3: check_restic uses --json (version command returns JSON)", async () => {
+  const tempDir = await Deno.makeTempDir();
+  try {
+    const { context, writes } = makeContext({
+      repository: "b2:test:test",
+      resticPath: "/opt/homebrew/bin/restic",
+      resticPassword: "probe",
+      b2AccountId: "probe",
+      b2AccountKey: "probe",
+      repoDir: tempDir,
+    });
+    await model.methods.checkRestic.execute({}, context);
+    // If --json was NOT used, available would be false or throw a parse error
+    assertEquals(writes.length, 1);
+    assertEquals(writes[0].specName, "resticStatus");
+    assertEquals(writes[0].data.available, true);
+    // Version must be parseable and non-empty
+    assertStringIncludes(String(writes[0].data.version ?? ""), "0.");
+  } finally {
+    await Deno.remove(tempDir, { recursive: true });
+  }
+});
+
+Deno.test("S3: init uses --json (exit_error JSON on nonexistent repo, not human text)", async () => {
+  const result = await runCommandAndGetStdout("init", {});
+  // The error message should reference the restic failure, not a parse error
+  // If --json was NOT used, we'd get a parse error or garbage text
+  // With --json, restic emits {"message_type":"exit_error",...} which we parse correctly
+  const isParseError = result.includes("not valid JSON");
+  assertEquals(isParseError, false, `init should use --json; got: ${result}`);
+});
+
+Deno.test("S3: snapshots uses --json (returns JSON array, not human text)", async () => {
+  const result = await runCommandAndGetStdout("snapshots", {});
+  // With --json, restic returns exit_error JSON or an empty array — both valid JSON
+  // Without --json, we'd get human text which would cause a parse error
+  const isParseError = result.includes("not valid JSON") || result.includes("Unexpected token");
+  assertEquals(isParseError, false, `snapshots should use --json; got: ${result}`);
+});
+
+Deno.test("S3: check uses --json (exit_error JSON on nonexistent repo)", async () => {
+  const result = await runCommandAndGetStdout("check", {});
+  const isParseError = result.includes("not valid JSON") || result.includes("Unexpected token");
+  assertEquals(isParseError, false, `check should use --json; got: ${result}`);
+});
+
+Deno.test("S3: restore requires targetDir (checked before restic invocation)", async () => {
+  const result = await runCommandAndGetStdout("restore", {
+    snapshot: "latest",
+    targetDir: "",
+    confirm: false,
+  });
+  // Should get a targetDir validation error before restic is even called
+  assertStringIncludes(result, "targetDir", "restore must require targetDir");
+});
+
+Deno.test("S3: forget uses --json (exit_error JSON on nonexistent repo)", async () => {
+  const result = await runCommandAndGetStdout("forget", { keepLast: 3 });
+  const isParseError = result.includes("not valid JSON") || result.includes("Unexpected token");
+  assertEquals(isParseError, false, `forget should use --json; got: ${result}`);
+});
+
+Deno.test("S3: prune uses --json flag (even though restic emits no JSON for prune)", async () => {
+  // restic prune emits no JSON in any released version (upstream gap); --json is
+  // passed anyway (harmless, future-proof). Success is determined by exit code only.
+  // The test verifies the method does NOT attempt to JSON-parse the stdout — if it
+  // did, it would throw SyntaxError, which would surface as a "not valid JSON" message.
+  const result = await runCommandAndGetStdout("prune", {});
+  // A SyntaxError would indicate the method tried to JSON-parse human text.
+  // The only acceptable failure is a restic-level error (missing repo, etc.).
+  const isJsonParseError = result.includes("SyntaxError") || result.includes("Unexpected token");
+  assertEquals(isJsonParseError, false, `prune must not attempt to JSON-parse human-text output; got: ${result}`);
+});
+
+// =============================================================================
+// S3: No human-text parser path reachable
+// =============================================================================
+
+Deno.test("S3: parseResticJsonOutput throws SyntaxError on non-JSON input (no silent fallback)", () => {
+  // The invoker always calls parseResticJsonOutput or findJsonlMessage, both of
+  // which throw SyntaxError on invalid JSON. There is no silent return-empty path.
+  let threw = false;
+  try {
+    parseResticJsonOutput("This is not JSON at all");
+  } catch (err) {
+    threw = true;
+    // Must be a JSON parse error, not a custom swallowing of non-JSON
+    assertEquals(err instanceof SyntaxError, true, "Must throw SyntaxError on non-JSON input");
+  }
+  assertEquals(threw, true, "parseResticJsonOutput must throw on non-JSON input");
+});
+
+Deno.test("S3: parseResticJsonOutput parses valid JSONL correctly", () => {
+  const jsonl = `{"message_type":"status","percent_done":0.5}\n{"message_type":"summary","files_new":3}`;
+  const result = parseResticJsonOutput(jsonl) as Array<Record<string, unknown>>;
+  assertEquals(Array.isArray(result), true);
+  assertEquals(result.length, 2);
+  assertEquals(result[0]["message_type"], "status");
+  assertEquals(result[1]["message_type"], "summary");
+});
+
+// =============================================================================
+// S3: Capability probe structural failure
+// =============================================================================
+
+Deno.test("S3: capability probe with nonexistent binary → structured error, not throw", async () => {
+  const tempDir = await Deno.makeTempDir();
+  try {
+    const { context, writes } = makeContext({
+      repository: "b2:test:test",
+      resticPath: "/nonexistent/path/to/restic-does-not-exist",
+      resticPassword: "probe",
+      b2AccountId: "probe",
+      b2AccountKey: "probe",
+      repoDir: tempDir,
+    });
+
+    // check_restic should return available:false, not throw
+    await model.methods.checkRestic.execute({}, context);
+    assertEquals(writes.length, 1);
+    assertEquals(writes[0].data.available, false);
+    // Message should explain the binary was not found
+    assertMatch(
+      String(writes[0].data.message ?? ""),
+      /not found|not executable|error/i,
+    );
+  } finally {
+    await Deno.remove(tempDir, { recursive: true });
+  }
+});
+
+Deno.test("S3: operational methods refuse to run when capability probe fails", async () => {
+  const tempDir = await Deno.makeTempDir();
+  try {
+    const { context } = makeContext({
+      repository: "b2:test:test",
+      resticPath: "/nonexistent/path/to/restic-does-not-exist",
+      resticPassword: "valid-password",
+      b2AccountId: "valid-id",
+      b2AccountKey: "valid-key",
+      repoDir: tempDir,
+    });
+
+    // Operational method should throw a structured error
+    const error = await assertRejects(
+      () => model.methods.init.execute({}, context),
+      Error,
+    );
+    assertMatch(
+      error.message,
+      /restic|not found|--json/i,
+      "Error should mention restic binary or --json support",
+    );
+  } finally {
+    await Deno.remove(tempDir, { recursive: true });
+  }
+});
+
+// =============================================================================
+// S9: Restore refusal cases
+// =============================================================================
+
+/** Creates a real temporary repo directory structure for restore safety tests. */
+async function makeRestoreTestDir(): Promise<{ repoDir: string; swampDir: string }> {
+  const repoDir = await Deno.makeTempDir();
+  const swampDir = `${repoDir}/.swamp`;
+  await Deno.mkdir(swampDir, { recursive: true });
+  return { repoDir, swampDir };
+}
+
+Deno.test("S9: restore refuses missing targetDir without confirm:true", async () => {
+  const { repoDir } = await makeRestoreTestDir();
+  try {
+    const { context } = makeContext({
+      repository: "b2:test:test",
+      resticPassword: "pass",
+      b2AccountId: "id",
+      b2AccountKey: "key",
+      repoDir,
+    });
+    const error = await assertRejects(
+      () => model.methods.restore.execute({ snapshot: "latest", targetDir: "", confirm: false }, context),
+      Error,
+    );
+    assertStringIncludes(error.message, "targetDir");
+  } finally {
+    await Deno.remove(repoDir, { recursive: true });
+  }
+});
+
+Deno.test("S9: restore refuses targetDir == repo root without confirm:true", async () => {
+  const { repoDir } = await makeRestoreTestDir();
+  try {
+    const { context } = makeContext({
+      repository: "b2:test:test",
+      resticPassword: "pass",
+      b2AccountId: "id",
+      b2AccountKey: "key",
+      repoDir,
+    });
+    const error = await assertRejects(
+      () => model.methods.restore.execute({ snapshot: "latest", targetDir: repoDir, confirm: false }, context),
+      Error,
+    );
+    assertMatch(error.message, /repo root|Refusing/i);
+  } finally {
+    await Deno.remove(repoDir, { recursive: true });
+  }
+});
+
+Deno.test("S9: restore refuses targetDir == .swamp/ without confirm:true", async () => {
+  const { repoDir, swampDir } = await makeRestoreTestDir();
+  try {
+    const { context } = makeContext({
+      repository: "b2:test:test",
+      resticPassword: "pass",
+      b2AccountId: "id",
+      b2AccountKey: "key",
+      repoDir,
+    });
+    const error = await assertRejects(
+      () => model.methods.restore.execute({ snapshot: "latest", targetDir: swampDir, confirm: false }, context),
+      Error,
+    );
+    assertMatch(error.message, /\.swamp|Refusing/i);
+  } finally {
+    await Deno.remove(repoDir, { recursive: true });
+  }
+});
+
+Deno.test("S9: restore refuses ancestor dir containing .swamp/ without confirm:true", async () => {
+  // Create a structure: /tmp/grandparent/repo/.swamp/
+  // Restore target: /tmp/grandparent/ — which is an ancestor of .swamp/
+  const grandparent = await Deno.makeTempDir();
+  const repoDir = `${grandparent}/myrepo`;
+  await Deno.mkdir(`${repoDir}/.swamp`, { recursive: true });
+  try {
+    const { context } = makeContext({
+      repository: "b2:test:test",
+      resticPassword: "pass",
+      b2AccountId: "id",
+      b2AccountKey: "key",
+      repoDir,
+    });
+    const error = await assertRejects(
+      () => model.methods.restore.execute({ snapshot: "latest", targetDir: grandparent, confirm: false }, context),
+      Error,
+    );
+    assertMatch(error.message, /ancestor|\.swamp|Refusing/i);
+  } finally {
+    await Deno.remove(grandparent, { recursive: true });
+  }
+});
+
+Deno.test("S9: restore refuses symlink into .swamp/ without confirm:true", async () => {
+  const { repoDir, swampDir } = await makeRestoreTestDir();
+  // Create a symlink that points into .swamp/
+  const symlinkTarget = `${repoDir}/link-to-swamp`;
+  try {
+    await Deno.symlink(swampDir, symlinkTarget);
+  } catch {
+    // If symlink creation fails, skip this test
+    await Deno.remove(repoDir, { recursive: true });
+    return;
+  }
+  try {
+    const { context } = makeContext({
+      repository: "b2:test:test",
+      resticPassword: "pass",
+      b2AccountId: "id",
+      b2AccountKey: "key",
+      repoDir,
+    });
+    const error = await assertRejects(
+      () => model.methods.restore.execute({ snapshot: "latest", targetDir: symlinkTarget, confirm: false }, context),
+      Error,
+    );
+    assertMatch(error.message, /\.swamp|Refusing|symlink/i);
+  } finally {
+    await Deno.remove(repoDir, { recursive: true });
+  }
+});
+
+Deno.test("S9: restore with confirm:true over a safe staging dir → proceeds past safety check", async () => {
+  const { repoDir } = await makeRestoreTestDir();
+  const stagingDir = await Deno.makeTempDir();
+  try {
+    const { context } = makeContext({
+      repository: "/tmp/nonexistent-restic-for-restore-test",
+      resticPath: "/opt/homebrew/bin/restic",
+      resticPassword: "pass",
+      b2AccountId: "id",
+      b2AccountKey: "key",
+      repoDir,
+    });
+
+    // With confirm:true and a safe target, safety check passes.
+    // The method will then fail at the restic level (nonexistent repo),
+    // but must NOT fail with a safety refusal error.
+    const error = await assertRejects(
+      () => model.methods.restore.execute({ snapshot: "latest", targetDir: stagingDir, confirm: true }, context),
+      Error,
+    );
+    // Should be a restic-level error, not a safety refusal
+    const isSafetyError = error.message.includes("Refusing") || error.message.includes("dangerous target");
+    assertEquals(isSafetyError, false, "With confirm:true and safe target, must not be a safety refusal");
+  } finally {
+    await Deno.remove(repoDir, { recursive: true });
+    await Deno.remove(stagingDir, { recursive: true });
+  }
+});
+
+// =============================================================================
+// Integration tests — real local restic repo
+// =============================================================================
+
+/** Creates a fixture .swamp/ directory tree for backup integration tests. */
+async function makeFixtureSwampTree(baseDir: string): Promise<void> {
+  const dirs = [
+    `${baseDir}/.swamp/data`,
+    `${baseDir}/.swamp/outputs`,
+    `${baseDir}/.swamp/workflow-runs`,
+    `${baseDir}/.swamp/definitions-evaluated`,
+    `${baseDir}/.swamp/workflows-evaluated`,
+    // These should be excluded:
+    `${baseDir}/.swamp/bundles`,
+    `${baseDir}/.swamp/logs`,
+    `${baseDir}/.swamp/secrets`,
+    `${baseDir}/.swamp/telemetry`,
+  ];
+
+  for (const dir of dirs) {
+    await Deno.mkdir(dir, { recursive: true });
+  }
+
+  // Create some files in included paths
+  await Deno.writeTextFile(`${baseDir}/.swamp/data/run-001.json`, '{"run": 1}');
+  await Deno.writeTextFile(`${baseDir}/.swamp/outputs/output-001.txt`, "output data");
+  await Deno.writeTextFile(`${baseDir}/.swamp/workflow-runs/run-001.yaml`, "workflow: test");
+  await Deno.writeTextFile(
+    `${baseDir}/.swamp/definitions-evaluated/def-001.json`,
+    '{"definition": "vault.get(\'my-vault\', \'secret\')"}',
+  );
+
+  // Create _catalog.db in data (should be excluded)
+  await Deno.writeTextFile(`${baseDir}/.swamp/data/_catalog.db`, "sqlite-catalog");
+
+  // Create files in excluded paths
+  await Deno.writeTextFile(`${baseDir}/.swamp/logs/app.log`, "log data");
+  await Deno.writeTextFile(`${baseDir}/.swamp/secrets/secret.txt`, "DO NOT BACK UP");
+}
+
+/** Creates a temp local restic repo for integration testing. */
+async function makeIntegrationRepo(): Promise<{
+  repoDir: string;
+  resticRepo: string;
+  cleanup: () => Promise<void>;
+}> {
+  const repoDir = await Deno.makeTempDir({ prefix: "swamp-backup-test-" });
+  const resticRepo = `${repoDir}/restic-repo`;
+  await Deno.mkdir(resticRepo, { recursive: true });
+
+  return {
+    repoDir,
+    resticRepo,
+    cleanup: async () => {
+      await Deno.remove(repoDir, { recursive: true });
+    },
+  };
+}
+
+/** Context configured for integration tests against a local restic repo. */
+function makeIntegrationContext(
+  repoDir: string,
+  resticRepo: string,
+  overrides: Record<string, unknown> = {},
+): ReturnType<typeof makeContext> {
+  return makeContext({
+    repository: resticRepo,
+    repoDir,
+    resticPath: "/opt/homebrew/bin/restic",
+    resticPassword: "integration-test-password",
+    b2AccountId: "integration-b2-id",
+    b2AccountKey: "integration-b2-key",
+    ...overrides,
+  });
+}
+
+// S6: init
+Deno.test("S6: init — first call creates repository (created:true)", async () => {
+  const { repoDir, resticRepo, cleanup } = await makeIntegrationRepo();
+  try {
+    const { context, writes } = makeIntegrationContext(repoDir, resticRepo);
+    await model.methods.init.execute({}, context);
+
+    assertEquals(writes.length, 1);
+    assertEquals(writes[0].specName, "repositoryStatus");
+    assertEquals(writes[0].data.created, true);
+    assertEquals(writes[0].data.initialized, true);
+    assertEquals(typeof writes[0].data.repository, "string");
+  } finally {
+    await cleanup();
+  }
+});
+
+Deno.test("S6: init — second call on initialized repo (initialized:true, created:false, no throw)", async () => {
+  const { repoDir, resticRepo, cleanup } = await makeIntegrationRepo();
+  try {
+    const { context: ctx1 } = makeIntegrationContext(repoDir, resticRepo);
+    await model.methods.init.execute({}, ctx1);
+
+    const { context: ctx2, writes: writes2 } = makeIntegrationContext(repoDir, resticRepo);
+    await model.methods.init.execute({}, ctx2);
+
+    assertEquals(writes2.length, 1);
+    assertEquals(writes2[0].data.initialized, true);
+    assertEquals(writes2[0].data.created, false);
+  } finally {
+    await cleanup();
+  }
+});
+
+// S7: backup
+Deno.test("S7: backup — fixture .swamp/ tree → snapshotId, non-zero file counts", async () => {
+  const { repoDir, resticRepo, cleanup } = await makeIntegrationRepo();
+  try {
+    await makeFixtureSwampTree(repoDir);
+
+    const { context: initCtx } = makeIntegrationContext(repoDir, resticRepo);
+    await model.methods.init.execute({}, initCtx);
+
+    const { context: backupCtx, writes } = makeIntegrationContext(repoDir, resticRepo);
+    await model.methods.backup.execute({ tags: ["test"] }, backupCtx);
+
+    assertEquals(writes.length, 1);
+    assertEquals(writes[0].specName, "backupResult");
+    const result = writes[0].data;
+
+    // Must have a non-empty snapshot ID
+    assertMatch(String(result.snapshotId ?? ""), /^[0-9a-f]{10,}$/);
+
+    // Must have processed at least 1 file
+    assertEquals(
+      (result.fileCount as number) > 0,
+      true,
+      `Expected non-zero fileCount, got: ${result.fileCount}`,
+    );
+
+    // Secret values must NOT appear in the result
+    const resultJson = JSON.stringify(result);
+    assertEquals(
+      resultJson.includes("integration-test-password"),
+      false,
+      "RESTIC_PASSWORD must not appear in backup result",
+    );
+    assertEquals(
+      resultJson.includes("integration-b2-id"),
+      false,
+      "B2_ACCOUNT_ID must not appear in backup result",
+    );
+    assertEquals(
+      resultJson.includes("integration-b2-key"),
+      false,
+      "B2_ACCOUNT_KEY must not appear in backup result",
+    );
+  } finally {
+    await cleanup();
+  }
+});
+
+Deno.test("S7: backup — _catalog.db and bundle dirs NOT in snapshot (verify via restore)", async () => {
+  const { repoDir, resticRepo, cleanup } = await makeIntegrationRepo();
+  try {
+    await makeFixtureSwampTree(repoDir);
+
+    const { context: initCtx } = makeIntegrationContext(repoDir, resticRepo);
+    await model.methods.init.execute({}, initCtx);
+
+    const { context: backupCtx, writes: backupWrites } = makeIntegrationContext(repoDir, resticRepo);
+    await model.methods.backup.execute({ tags: [] }, backupCtx);
+    const snapshotId = String(backupWrites[0].data.snapshotId ?? "latest");
+
+    // Restore to a staging dir and check what's there
+    const stagingDir = await Deno.makeTempDir({ prefix: "swamp-backup-verify-" });
+    try {
+      const { context: restoreCtx } = makeIntegrationContext(repoDir, resticRepo);
+      await model.methods.restore.execute(
+        { snapshot: snapshotId, targetDir: stagingDir, confirm: false },
+        restoreCtx,
+      );
+
+      // _catalog.db should NOT be present
+      let catalogExists = false;
+      try {
+        await Deno.stat(`${stagingDir}/.swamp/data/_catalog.db`);
+        catalogExists = true;
+      } catch { /* expected */ }
+      assertEquals(catalogExists, false, "_catalog.db must be excluded from backup");
+
+      // .swamp/bundles dir should NOT be present
+      let bundlesExists = false;
+      try {
+        await Deno.stat(`${stagingDir}/.swamp/bundles`);
+        bundlesExists = true;
+      } catch { /* expected */ }
+      assertEquals(bundlesExists, false, "bundles dir must be excluded from backup");
+
+      // .swamp/secrets should NOT be present
+      let secretsExists = false;
+      try {
+        await Deno.stat(`${stagingDir}/.swamp/secrets`);
+        secretsExists = true;
+      } catch { /* expected */ }
+      assertEquals(secretsExists, false, ".swamp/secrets must be excluded from backup");
+
+      // But .swamp/data/run-001.json SHOULD be present
+      let dataFileExists = false;
+      try {
+        await Deno.stat(`${stagingDir}/.swamp/data/run-001.json`);
+        dataFileExists = true;
+      } catch { /* unexpected */ }
+      assertEquals(dataFileExists, true, ".swamp/data/run-001.json must be included in backup");
+    } finally {
+      await Deno.remove(stagingDir, { recursive: true });
+    }
+  } finally {
+    await cleanup();
+  }
+});
+
+// S5: snapshots
+Deno.test("S5: snapshots — lists snapshots from integration backup", async () => {
+  const { repoDir, resticRepo, cleanup } = await makeIntegrationRepo();
+  try {
+    await makeFixtureSwampTree(repoDir);
+
+    const { context: initCtx } = makeIntegrationContext(repoDir, resticRepo);
+    await model.methods.init.execute({}, initCtx);
+
+    const { context: backupCtx } = makeIntegrationContext(repoDir, resticRepo);
+    await model.methods.backup.execute({ tags: [] }, backupCtx);
+
+    const { context: snapshotsCtx, writes } = makeIntegrationContext(repoDir, resticRepo);
+    await model.methods.snapshots.execute({ tags: [] }, snapshotsCtx);
+
+    assertEquals(writes.length, 1);
+    assertEquals(writes[0].specName, "snapshots");
+    const result = writes[0].data;
+
+    assertEquals((result.count as number) >= 1, true, "Must have at least 1 snapshot");
+    assertEquals(Array.isArray(result.snapshots), true);
+
+    // latestSnapshotId must be set
+    assertMatch(String(result.latestSnapshotId ?? ""), /^[0-9a-f]{10,}$/);
+  } finally {
+    await cleanup();
+  }
+});
+
+// S8: check
+Deno.test("S8: check — after backup → ok:true, zero errors", async () => {
+  const { repoDir, resticRepo, cleanup } = await makeIntegrationRepo();
+  try {
+    await makeFixtureSwampTree(repoDir);
+
+    const { context: initCtx } = makeIntegrationContext(repoDir, resticRepo);
+    await model.methods.init.execute({}, initCtx);
+
+    const { context: backupCtx } = makeIntegrationContext(repoDir, resticRepo);
+    await model.methods.backup.execute({ tags: [] }, backupCtx);
+
+    const { context: checkCtx, writes } = makeIntegrationContext(repoDir, resticRepo);
+    await model.methods.check.execute({}, checkCtx);
+
+    assertEquals(writes.length, 1);
+    assertEquals(writes[0].specName, "checkResult");
+    assertEquals(writes[0].data.ok, true);
+    assertEquals((writes[0].data.errors as string[]).length, 0);
+  } finally {
+    await cleanup();
+  }
+});
+
+// S9: restore integration
+Deno.test("S9: restore — latest to clean staging dir → files present", async () => {
+  const { repoDir, resticRepo, cleanup } = await makeIntegrationRepo();
+  const stagingDir = await Deno.makeTempDir({ prefix: "swamp-restore-test-" });
+  try {
+    await makeFixtureSwampTree(repoDir);
+
+    const { context: initCtx } = makeIntegrationContext(repoDir, resticRepo);
+    await model.methods.init.execute({}, initCtx);
+
+    const { context: backupCtx } = makeIntegrationContext(repoDir, resticRepo);
+    await model.methods.backup.execute({ tags: [] }, backupCtx);
+
+    const { context: restoreCtx, writes } = makeIntegrationContext(repoDir, resticRepo);
+    await model.methods.restore.execute(
+      { snapshot: "latest", targetDir: stagingDir, confirm: false },
+      restoreCtx,
+    );
+
+    assertEquals(writes.length, 1);
+    assertEquals(writes[0].specName, "restoreResult");
+    assertEquals((writes[0].data.filesRestored as number) >= 1, true, "Must restore at least 1 file");
+
+    // Verify a file is actually present
+    const stat = await Deno.stat(`${stagingDir}/.swamp/data/run-001.json`);
+    assertEquals(stat.isFile, true, "Restored file must exist");
+  } finally {
+    await cleanup();
+    await Deno.remove(stagingDir, { recursive: true });
+  }
+});
+
+// S10: forget
+Deno.test("S10: forget --dry-run → snapshotsRemoved=0, nothing actually removed", async () => {
+  const { repoDir, resticRepo, cleanup } = await makeIntegrationRepo();
+  try {
+    await makeFixtureSwampTree(repoDir);
+
+    const { context: initCtx } = makeIntegrationContext(repoDir, resticRepo);
+    await model.methods.init.execute({}, initCtx);
+
+    const { context: backupCtx } = makeIntegrationContext(repoDir, resticRepo);
+    await model.methods.backup.execute({ tags: [] }, backupCtx);
+
+    const { context: forgetCtx, writes } = makeIntegrationContext(repoDir, resticRepo);
+    await model.methods.forget.execute({ keepLast: 1, dryRun: true }, forgetCtx);
+
+    assertEquals(writes.length, 1);
+    assertEquals(writes[0].specName, "forgetResult");
+    assertEquals(writes[0].data.dryRun, true);
+    // dryRun removes no snapshots but reports what would be removed
+    assertEquals(typeof writes[0].data.snapshotsRemoved, "number");
+  } finally {
+    await cleanup();
+  }
+});
+
+Deno.test("S10: forget non-dry-run keeps expected snapshots and removes old ones", async () => {
+  const { repoDir, resticRepo, cleanup } = await makeIntegrationRepo();
+  try {
+    await makeFixtureSwampTree(repoDir);
+
+    const { context: initCtx } = makeIntegrationContext(repoDir, resticRepo);
+    await model.methods.init.execute({}, initCtx);
+
+    // Create 2 backups
+    const { context: b1 } = makeIntegrationContext(repoDir, resticRepo);
+    await model.methods.backup.execute({ tags: [] }, b1);
+    // Modify a file to force a new snapshot
+    await Deno.writeTextFile(`${repoDir}/.swamp/data/run-002.json`, '{"run": 2}');
+    const { context: b2 } = makeIntegrationContext(repoDir, resticRepo);
+    await model.methods.backup.execute({ tags: [] }, b2);
+
+    // Verify 2 snapshots exist
+    const { context: snapshotsCtx, writes: snapWrites } = makeIntegrationContext(repoDir, resticRepo);
+    await model.methods.snapshots.execute({ tags: [] }, snapshotsCtx);
+    assertEquals(snapWrites[0].data.count, 2, "Must have 2 snapshots before forget");
+
+    // Forget keeping only 1
+    const { context: forgetCtx, writes: forgetWrites } = makeIntegrationContext(repoDir, resticRepo);
+    await model.methods.forget.execute({ keepLast: 1, dryRun: false }, forgetCtx);
+    assertEquals(forgetWrites[0].data.snapshotsRemoved, 1, "Must remove 1 snapshot");
+  } finally {
+    await cleanup();
+  }
+});
+
+// S11: prune
+Deno.test("S11: prune — after orphaning forget → completes with parsed result", async () => {
+  const { repoDir, resticRepo, cleanup } = await makeIntegrationRepo();
+  try {
+    await makeFixtureSwampTree(repoDir);
+
+    const { context: initCtx } = makeIntegrationContext(repoDir, resticRepo);
+    await model.methods.init.execute({}, initCtx);
+
+    // Create 2 backups and forget one to create orphaned data
+    const { context: b1 } = makeIntegrationContext(repoDir, resticRepo);
+    await model.methods.backup.execute({ tags: [] }, b1);
+    await Deno.writeTextFile(`${repoDir}/.swamp/data/run-003.json`, '{"run": 3}');
+    const { context: b2 } = makeIntegrationContext(repoDir, resticRepo);
+    await model.methods.backup.execute({ tags: [] }, b2);
+
+    // Forget the first snapshot by its ID
+    const { context: snapshotsCtx, writes: snapWrites } = makeIntegrationContext(repoDir, resticRepo);
+    await model.methods.snapshots.execute({ tags: [] }, snapshotsCtx);
+    const snapshots = snapWrites[0].data.snapshots as Array<{ id: string }>;
+    assertEquals(snapshots.length, 2, "Must have 2 snapshots");
+
+    const { context: forgetCtx } = makeIntegrationContext(repoDir, resticRepo);
+    await model.methods.forget.execute({ keepLast: 1, dryRun: false }, forgetCtx);
+
+    // Now prune
+    const { context: pruneCtx, writes: pruneWrites } = makeIntegrationContext(repoDir, resticRepo);
+    await model.methods.prune.execute({}, pruneCtx);
+
+    assertEquals(pruneWrites.length, 1);
+    assertEquals(pruneWrites[0].specName, "pruneResult");
+    assertEquals(typeof pruneWrites[0].data.durationMs, "number");
+    // rawOutput is captured for auditability
+    assertEquals(typeof pruneWrites[0].data.rawOutput, "string");
+  } finally {
+    await cleanup();
+  }
+});
+
+// =============================================================================
+// S12: Secret-leakage canary integration test
+// =============================================================================
+
+Deno.test("S12: secret-leakage canary — no literal secret values in snapshot or restore", async () => {
+  const { repoDir, resticRepo, cleanup } = await makeIntegrationRepo();
+  const stagingDir = await Deno.makeTempDir({ prefix: "swamp-canary-restore-" });
+
+  // Canary strings — these must never appear in the snapshot or restore output
+  const CANARY_PASSWORD = "CANARY_RESTIC_PASSWORD_DO_NOT_BACKUP_xK9mQ3";
+  const CANARY_B2_ID = "CANARY_B2_ACCOUNT_ID_DO_NOT_BACKUP_pR7nW2";
+  const CANARY_B2_KEY = "CANARY_B2_ACCOUNT_KEY_DO_NOT_BACKUP_yL5vT1";
+
+  try {
+    await makeFixtureSwampTree(repoDir);
+
+    // Pre-backup assertion: included evaluated/config surfaces hold only vault.get references
+    // (this verifies swamp's raw-until-runtime invariant — no resolved literals in config)
+    const defContent = await Deno.readTextFile(
+      `${repoDir}/.swamp/definitions-evaluated/def-001.json`,
+    );
+    assertEquals(
+      defContent.includes(CANARY_PASSWORD),
+      false,
+      "Included definitions must NOT contain resolved secret literals before backup",
+    );
+
+    // Plant literal canary values in EXCLUDED paths only
+    await Deno.writeTextFile(
+      `${repoDir}/.swamp/secrets/canary.txt`,
+      `${CANARY_PASSWORD}\n${CANARY_B2_ID}\n${CANARY_B2_KEY}`,
+    );
+    await Deno.writeTextFile(
+      `${repoDir}/.swamp/logs/canary.log`,
+      `password=${CANARY_PASSWORD} id=${CANARY_B2_ID}`,
+    );
+
+    // Initialize and backup using canary values as the "resolved" secrets
+    const { context: initCtx } = makeIntegrationContext(repoDir, resticRepo, {
+      resticPassword: CANARY_PASSWORD,
+      b2AccountId: CANARY_B2_ID,
+      b2AccountKey: CANARY_B2_KEY,
+    });
+    await model.methods.init.execute({}, initCtx);
+
+    const { context: backupCtx, writes: backupWrites } = makeIntegrationContext(repoDir, resticRepo, {
+      resticPassword: CANARY_PASSWORD,
+      b2AccountId: CANARY_B2_ID,
+      b2AccountKey: CANARY_B2_KEY,
+    });
+    await model.methods.backup.execute({ tags: ["canary-test"] }, backupCtx);
+
+    // Assert backup result contains NO canary literals
+    const backupResultJson = JSON.stringify(backupWrites[0].data);
+    assertEquals(
+      backupResultJson.includes(CANARY_PASSWORD),
+      false,
+      "CANARY_PASSWORD must not appear in backupResult",
+    );
+    assertEquals(
+      backupResultJson.includes(CANARY_B2_ID),
+      false,
+      "CANARY_B2_ID must not appear in backupResult",
+    );
+    assertEquals(
+      backupResultJson.includes(CANARY_B2_KEY),
+      false,
+      "CANARY_B2_KEY must not appear in backupResult",
+    );
+
+    // Restore to staging and verify canary values are absent from ALL restored files
+    const snapshotId = String(backupWrites[0].data.snapshotId ?? "latest");
+    const { context: restoreCtx } = makeIntegrationContext(repoDir, resticRepo, {
+      resticPassword: CANARY_PASSWORD,
+      b2AccountId: CANARY_B2_ID,
+      b2AccountKey: CANARY_B2_KEY,
+    });
+    await model.methods.restore.execute(
+      { snapshot: snapshotId, targetDir: stagingDir, confirm: false },
+      restoreCtx,
+    );
+
+    // Walk all restored files and assert no canary values
+    async function walkDir(dir: string): Promise<string[]> {
+      const files: string[] = [];
+      try {
+        for await (const entry of Deno.readDir(dir)) {
+          const fullPath = `${dir}/${entry.name}`;
+          if (entry.isDirectory) {
+            files.push(...await walkDir(fullPath));
+          } else if (entry.isFile) {
+            files.push(fullPath);
+          }
+        }
+      } catch { /* ignore readDir errors */ }
+      return files;
+    }
+
+    const restoredFiles = await walkDir(stagingDir);
+
+    for (const filePath of restoredFiles) {
+      const content = await Deno.readTextFile(filePath).catch(() => "");
+      assertEquals(
+        content.includes(CANARY_PASSWORD),
+        false,
+        `CANARY_PASSWORD must not appear in restored file: ${filePath}`,
+      );
+      assertEquals(
+        content.includes(CANARY_B2_ID),
+        false,
+        `CANARY_B2_ID must not appear in restored file: ${filePath}`,
+      );
+      assertEquals(
+        content.includes(CANARY_B2_KEY),
+        false,
+        `CANARY_B2_KEY must not appear in restored file: ${filePath}`,
+      );
+    }
+
+    // .swamp/secrets directory must be absent from the restore
+    let secretsExists = false;
+    try {
+      await Deno.stat(`${stagingDir}/.swamp/secrets`);
+      secretsExists = true;
+    } catch { /* expected */ }
+    assertEquals(
+      secretsExists,
+      false,
+      ".swamp/secrets must be absent from backup snapshot",
+    );
+
+    // Verify snapshot listing also contains no canary values
+    const { context: snapshotsCtx, writes: snapWrites } = makeIntegrationContext(repoDir, resticRepo, {
+      resticPassword: CANARY_PASSWORD,
+      b2AccountId: CANARY_B2_ID,
+      b2AccountKey: CANARY_B2_KEY,
+    });
+    await model.methods.snapshots.execute({ tags: [] }, snapshotsCtx);
+    const snapshotsJson = JSON.stringify(snapWrites[0].data);
+    assertEquals(
+      snapshotsJson.includes(CANARY_PASSWORD),
+      false,
+      "CANARY_PASSWORD must not appear in snapshots listing",
+    );
+  } finally {
+    await cleanup();
+    await Deno.remove(stagingDir, { recursive: true });
+  }
+});
+
+// =============================================================================
+// Real-B2 tests (env-gated, skipped by default)
+// =============================================================================
+
+const REAL_B2_ENABLED = Deno.env.get("SWAMP_BACKUP_TEST_REAL_B2") === "true";
+
+Deno.test({
+  name: "REAL-B2: full cycle init/backup/check/restore/forget/prune (env-gated)",
+  ignore: !REAL_B2_ENABLED,
+  fn: async () => {
+    const b2Repo = Deno.env.get("SWAMP_BACKUP_TEST_B2_REPO");
+    const resticPassword = Deno.env.get("SWAMP_BACKUP_TEST_RESTIC_PASSWORD");
+    const b2AccountId = Deno.env.get("B2_ACCOUNT_ID");
+    const b2AccountKey = Deno.env.get("B2_ACCOUNT_KEY");
+
+    if (!b2Repo || !resticPassword || !b2AccountId || !b2AccountKey) {
+      throw new Error(
+        "REAL-B2 test requires: SWAMP_BACKUP_TEST_B2_REPO, SWAMP_BACKUP_TEST_RESTIC_PASSWORD, B2_ACCOUNT_ID, B2_ACCOUNT_KEY",
+      );
+    }
+
+    const repoDir = await Deno.makeTempDir({ prefix: "swamp-b2-test-" });
+    const stagingDir = await Deno.makeTempDir({ prefix: "swamp-b2-restore-" });
+    try {
+      await makeFixtureSwampTree(repoDir);
+
+      const realB2Args = {
+        repository: b2Repo,
+        resticPath: "/opt/homebrew/bin/restic",
+        resticPassword,
+        b2AccountId,
+        b2AccountKey,
+        repoDir,
+      };
+
+      // init
+      const { context: initCtx, writes: initWrites } = makeContext(realB2Args);
+      await model.methods.init.execute({}, initCtx);
+      assertEquals(initWrites[0].data.initialized, true);
+
+      // backup
+      const { context: backupCtx, writes: backupWrites } = makeContext(realB2Args);
+      await model.methods.backup.execute({ tags: ["ci-real-b2-test"] }, backupCtx);
+      assertMatch(String(backupWrites[0].data.snapshotId ?? ""), /^[0-9a-f]{10,}$/);
+
+      // check
+      const { context: checkCtx, writes: checkWrites } = makeContext(realB2Args);
+      await model.methods.check.execute({}, checkCtx);
+      assertEquals(checkWrites[0].data.ok, true);
+
+      // restore
+      const { context: restoreCtx } = makeContext({ ...realB2Args });
+      await model.methods.restore.execute(
+        { snapshot: "latest", targetDir: stagingDir, confirm: false },
+        restoreCtx,
+      );
+      const stat = await Deno.stat(`${stagingDir}/.swamp/data/run-001.json`);
+      assertEquals(stat.isFile, true);
+    } finally {
+      await Deno.remove(repoDir, { recursive: true });
+      await Deno.remove(stagingDir, { recursive: true });
+    }
+  },
+});

@@ -1,0 +1,9 @@
+{
+  "name": "@atalanta/restic-backup",
+  "version": "2026.6.27",
+  "description": "Swamp model extension for restic backups to Backblaze B2",
+  "scripts": {
+    "test": "~/.swamp/deno/deno test --allow-all extensions/models/restic_backup_test.ts"
+  },
+  "dependencies": {}
+}

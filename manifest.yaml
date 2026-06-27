@@ -1,0 +1,6 @@
+version: "2026.06.27.1"
+models:
+  - name: restic-backup
+    type: "@atalanta/restic-backup/repository"
+    description: "Backs up a swamp repo's .swamp/ runtime evidence to a Backblaze B2 restic repository"
+    source: extensions/models/restic_backup.ts
