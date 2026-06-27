@@ -325,14 +325,19 @@ function redactSecrets(text: string, secrets: ResticSecrets): string {
 /**
  * Invoke a restic command.
  * argv[0] is the binary; all subsequent elements are arguments.
- * env overrides the full subprocess environment — callers must supply the
- * complete env they want (see invokeRestic and invokeResticNoSecrets below).
+ * env overrides or adds to the subprocess environment.
+ * When clearEnv is true, the subprocess starts with an EMPTY environment and
+ * only the keys in env are present — this is the mechanism used by the no-secrets
+ * probe to prevent ambient credential vars from leaking into the child process.
+ * (Deno.Command's env option merges with the parent env; only clearEnv=true gives
+ * a fully isolated environment.)
  * Returns the raw stdout/stderr/exitCode without parsing.
  */
 async function spawnRestic(
   argv: string[],
   env: Record<string, string>,
   cwd: string,
+  clearEnv: boolean = false,
 ): Promise<ResticResult> {
   const startTime = performance.now();
 
@@ -343,6 +348,8 @@ async function spawnRestic(
     stdin: "null",
     cwd,
     env,
+    // deno-lint-ignore no-explicit-any
+    ...(clearEnv ? { clearEnv: true } as Record<string, any> : {}),
   });
 
   // Deno.Command.output() throws a NotFound error when the binary doesn't exist.
@@ -399,14 +406,32 @@ async function invokeRestic(
  * Invoke a restic command that does NOT touch the repository (e.g. `restic version`).
  * No secrets are injected. Used by the capability probe so that check_restic can
  * verify binary presence without requiring vault secrets to be configured.
+ *
+ * IMPORTANT: The ambient process environment is scrubbed of all restic credential
+ * and cloud-provider auth vars before spawning. This prevents ambient credentials
+ * (e.g. RESTIC_PASSWORD already set in the shell) from leaking into probe output,
+ * which would allow them to appear in check_restic's logged probe-failure messages
+ * before any redactSecrets call can run.
  */
 async function invokeResticNoSecrets(
   argv: string[],
   cwd: string,
 ): Promise<ResticResult> {
-  // Inherit the ambient env without adding any secret keys.
-  const subprocessEnv: Record<string, string> = { ...Deno.env.toObject() };
-  return spawnRestic(argv, subprocessEnv, cwd);
+  // Use clearEnv=true so the subprocess inherits NO parent env vars at all.
+  // Deno.Command's env option MERGES with the parent env (deleting from a spread
+  // copy has no effect because the OS-level fork still copies the full parent env
+  // unless clearEnv is set). clearEnv=true gives an isolated environment where
+  // only the keys we explicitly provide are present.
+  //
+  // The version probe only needs PATH (to find system libraries if the binary is
+  // dynamically linked). We preserve PATH from the parent to avoid "not found"
+  // errors on systems where the binary is on a non-default PATH.
+  const probeEnv: Record<string, string> = {};
+  const parentPath = Deno.env.get("PATH");
+  if (parentPath !== undefined) {
+    probeEnv["PATH"] = parentPath;
+  }
+  return spawnRestic(argv, probeEnv, cwd, /* clearEnv= */ true);
 }
 
 // =============================================================================
@@ -877,7 +902,18 @@ export const model = {
         let message = "";
 
         if (result.success) {
-          const parsed = JSON.parse(result.stdout.trim()) as Record<string, unknown>;
+          // Wrap the parse in a redacting catch: a buggy/hostile restic could exit 0
+          // with malformed JSON that embeds secret values; the SyntaxError message can
+          // then include a raw snippet of the output. We never include raw subprocess
+          // output in the thrown error — only a sanitized summary.
+          let parsed: Record<string, unknown>;
+          try {
+            parsed = JSON.parse(result.stdout.trim()) as Record<string, unknown>;
+          } catch {
+            throw new Error(
+              "restic init --json exited 0 but emitted invalid JSON — cannot parse result",
+            );
+          }
           if (parsed["message_type"] === "initialized") {
             created = true;
             initialized = true;
@@ -989,8 +1025,17 @@ export const model = {
           );
         }
 
-        // The summary message is the last JSONL line with message_type=summary
-        const summary = findJsonlMessage(result.stdout, "summary");
+        // The summary message is the last JSONL line with message_type=summary.
+        // Wrap in a redacting catch: a buggy/hostile restic could exit 0 with malformed
+        // JSON that embeds secret values; SyntaxError can include a raw output snippet.
+        let summary: Record<string, unknown> | null;
+        try {
+          summary = findJsonlMessage(result.stdout, "summary");
+        } catch {
+          throw new Error(
+            "restic backup --json exited 0 but emitted invalid JSON — cannot parse result",
+          );
+        }
         if (summary === null) {
           throw new Error(
             "restic backup --json did not emit a summary message — cannot parse result",
@@ -1085,10 +1130,18 @@ export const model = {
           );
         }
 
-        // snapshots --json returns a JSON array
-        const snapshotArray = JSON.parse(result.stdout.trim()) as Array<
-          Record<string, unknown>
-        >;
+        // snapshots --json returns a JSON array.
+        // Wrap in a redacting catch: malformed-but-exit-0 stdout could embed secrets.
+        let snapshotArray: Array<Record<string, unknown>>;
+        try {
+          snapshotArray = JSON.parse(result.stdout.trim()) as Array<
+            Record<string, unknown>
+          >;
+        } catch {
+          throw new Error(
+            "restic snapshots --json exited 0 but emitted invalid JSON — cannot parse result",
+          );
+        }
 
         const snapshots = snapshotArray.map((snap) => ({
           id: (snap["id"] as string) ?? "",
@@ -1163,8 +1216,15 @@ export const model = {
         );
 
         // check --json emits a summary JSONL line
-        // exit 0 = ok, exit non-zero = errors found
-        const summary = findJsonlMessage(result.stdout, "summary");
+        // exit 0 = ok, exit non-zero = errors found.
+        // Wrap in a redacting catch: malformed-but-exit-0 stdout could embed secrets.
+        let summary: Record<string, unknown> | null;
+        try {
+          summary = findJsonlMessage(result.stdout, "summary");
+        } catch {
+          // check doesn't need a summary to report errors — treat as no summary found.
+          summary = null;
+        }
 
         const numErrors = (summary?.["num_errors"] as number) ?? 0;
         const ok = result.success && numErrors === 0;
@@ -1290,7 +1350,14 @@ export const model = {
           );
         }
 
-        const summary = findJsonlMessage(result.stdout, "summary");
+        // Wrap in a redacting catch: malformed-but-exit-0 stdout could embed secrets.
+        let summary: Record<string, unknown> | null;
+        try {
+          summary = findJsonlMessage(result.stdout, "summary");
+        } catch {
+          // Missing summary is non-fatal for restore — files were written; counts default to 0.
+          summary = null;
+        }
 
         const filesRestored = (summary?.["files_restored"] as number) ?? 0;
         const bytesRestored = (summary?.["bytes_restored"] as number) ?? 0;
@@ -1372,10 +1439,18 @@ export const model = {
           );
         }
 
-        // forget --json returns an array of group objects
-        const groups = JSON.parse(result.stdout.trim()) as Array<
-          Record<string, unknown>
-        >;
+        // forget --json returns an array of group objects.
+        // Wrap in a redacting catch: malformed-but-exit-0 stdout could embed secrets.
+        let groups: Array<Record<string, unknown>>;
+        try {
+          groups = JSON.parse(result.stdout.trim()) as Array<
+            Record<string, unknown>
+          >;
+        } catch {
+          throw new Error(
+            "restic forget --json exited 0 but emitted invalid JSON — cannot parse result",
+          );
+        }
 
         let totalRemoved = 0;
         for (const group of groups) {

@@ -905,6 +905,80 @@ Deno.test("S9: restore with confirm:true over a safe staging dir → proceeds pa
 });
 
 // =============================================================================
+// R2-MEDIUM-001: invokeResticNoSecrets scrubs ambient credential env vars
+// =============================================================================
+// The probe (restic version --json) must not inherit RESTIC_PASSWORD, B2_ACCOUNT_ID,
+// or B2_ACCOUNT_KEY from the ambient process environment. If it did, those values
+// could appear in probe-failure messages logged by check_restic before any
+// redactSecrets call is possible.
+
+Deno.test("R2-MEDIUM-001: probe binary does not receive ambient RESTIC_PASSWORD / B2_* env vars", async () => {
+  // Plant known canary values in the process env to simulate ambient credentials.
+  const AMBIENT_PASSWORD = "AMBIENT_PROBE_PASSWORD_9mXkQ2_MUST_NOT_REACH_PROBE";
+  const AMBIENT_B2_ID = "AMBIENT_PROBE_B2_ID_7pNvR4_MUST_NOT_REACH_PROBE";
+  const AMBIENT_B2_KEY = "AMBIENT_PROBE_B2_KEY_3wSfT8_MUST_NOT_REACH_PROBE";
+
+  // Set ambient env vars that look like restic/B2 credentials.
+  Deno.env.set("RESTIC_PASSWORD", AMBIENT_PASSWORD);
+  Deno.env.set("B2_ACCOUNT_ID", AMBIENT_B2_ID);
+  Deno.env.set("B2_ACCOUNT_KEY", AMBIENT_B2_KEY);
+
+  const tmpDir = await Deno.makeTempDir({ prefix: "swamp-r2med001-" });
+  // The fake restic dumps its entire env to a file, then responds as a valid version probe.
+  const envDumpFile = `${tmpDir}/env-dump`;
+  const fakeBinary = `${tmpDir}/fake-restic`;
+  await Deno.writeTextFile(
+    fakeBinary,
+    `#!/bin/sh
+env > "${envDumpFile}"
+echo '{"message_type":"version","version":"0.18.0","go_version":"go1.21","go_os":"linux","go_arch":"amd64"}'
+exit 0
+`,
+  );
+  await Deno.chmod(fakeBinary, 0o755);
+
+  try {
+    const { context } = makeContext({
+      repository: "b2:test:test",
+      resticPath: fakeBinary,
+      // check_restic deliberately uses empty secrets (F1 invariant).
+      resticPassword: "",
+      b2AccountId: "",
+      b2AccountKey: "",
+      repoDir: tmpDir,
+    });
+
+    await model.methods.checkRestic.execute({}, context);
+
+    // Read the env that was actually passed to the probe subprocess.
+    const envContent = await Deno.readTextFile(envDumpFile);
+
+    // None of the ambient credential vars must appear in the probe's environment.
+    assertEquals(
+      envContent.includes(AMBIENT_PASSWORD),
+      false,
+      "RESTIC_PASSWORD ambient value must NOT be passed to the probe subprocess",
+    );
+    assertEquals(
+      envContent.includes(AMBIENT_B2_ID),
+      false,
+      "B2_ACCOUNT_ID ambient value must NOT be passed to the probe subprocess",
+    );
+    assertEquals(
+      envContent.includes(AMBIENT_B2_KEY),
+      false,
+      "B2_ACCOUNT_KEY ambient value must NOT be passed to the probe subprocess",
+    );
+  } finally {
+    // Clean up ambient env vars we set.
+    Deno.env.delete("RESTIC_PASSWORD");
+    Deno.env.delete("B2_ACCOUNT_ID");
+    Deno.env.delete("B2_ACCOUNT_KEY");
+    await Deno.remove(tmpDir, { recursive: true });
+  }
+});
+
+// =============================================================================
 // R1: Restore safety with repoDir='.' (default) and relative paths
 // =============================================================================
 // Bug: when repoDir='.', resolvePathWithAncestor('.', '.') produced '/' because
@@ -1623,129 +1697,390 @@ Deno.test("S12: secret-leakage canary — no literal secret values in snapshot o
 // =============================================================================
 // R2: Failure-path secret redaction canary
 // =============================================================================
-// A fake restic binary that ALWAYS exits non-zero while echoing all three secret
-// canary values to both stdout and stderr. Each method must throw an Error whose
-// message contains NONE of the canary values — confirming redactSecrets is applied
-// to all subprocess-derived strings before they enter thrown errors.
+// Two sub-tests:
+//   R2a — per-method failure branches (exit-1 with secrets in stdout/stderr):
+//     The fake binary returns VALID version JSON so the probe passes, then fails
+//     only on the method's own command. Call-count tracking verifies each method's
+//     own failure branch was reached (probe=call1, method=call2).
+//   R2b — malformed-success-output (exit-0 with invalid JSON containing secrets):
+//     A fake binary that exits 0 while emitting invalid JSON containing canaries.
+//     The model must throw a sanitised error (no raw output, no canaries).
 
-Deno.test("R2: failure-path errors redact secrets — canary values absent from thrown error messages", async () => {
-  const CANARY_PASSWORD = "CANARY_R2_PASSWORD_xK9mQ3_MUST_NOT_LEAK";
-  const CANARY_B2_ID = "CANARY_R2_B2_ID_pR7nW2_MUST_NOT_LEAK";
-  const CANARY_B2_KEY = "CANARY_R2_B2_KEY_yL5vT1_MUST_NOT_LEAK";
+/** Helper: assert no canary value appears in the string. */
+function assertNoCanaryInMessage(
+  msg: string,
+  label: string,
+  canaryPassword: string,
+  canaryB2Id: string,
+  canaryB2Key: string,
+): void {
+  assertEquals(
+    msg.includes(canaryPassword),
+    false,
+    `${label}: CANARY_PASSWORD must not appear in error message — got: ${msg}`,
+  );
+  assertEquals(
+    msg.includes(canaryB2Id),
+    false,
+    `${label}: CANARY_B2_ID must not appear in error message — got: ${msg}`,
+  );
+  assertEquals(
+    msg.includes(canaryB2Key),
+    false,
+    `${label}: CANARY_B2_KEY must not appear in error message — got: ${msg}`,
+  );
+}
 
-  const tmpDir = await Deno.makeTempDir({ prefix: "swamp-r2-canary-" });
-  const fakeBinary = `${tmpDir}/fake-restic`;
-  const repoDir = tmpDir;
+Deno.test("R2a: per-method failure branches — secrets absent from thrown error messages", async () => {
+  // Each method is tested with its OWN fake binary that:
+  //   call 1 (version --json): returns valid version JSON → probe PASSES
+  //   calls 2+: echoes all three canary values to stdout+stderr → exits 1
+  // A call-count file proves the method's own failure branch (call ≥ 2) was reached.
 
-  // Write a fake restic that echoes all three canary values in stdout AND stderr,
-  // then exits non-zero. This simulates a restic binary that accidentally reflects
-  // secrets in its diagnostic output.
-  await Deno.writeTextFile(
-    fakeBinary,
-    `#!/bin/sh
-# Echo canaries to both stdout (as JSON line) and stderr
+  const CANARY_PASSWORD = "CANARY_R2A_PASSWORD_xK9mQ3_MUST_NOT_LEAK";
+  const CANARY_B2_ID = "CANARY_R2A_B2_ID_pR7nW2_MUST_NOT_LEAK";
+  const CANARY_B2_KEY = "CANARY_R2A_B2_KEY_yL5vT1_MUST_NOT_LEAK";
+
+  const assertNoCanary = (msg: string, label: string) =>
+    assertNoCanaryInMessage(msg, label, CANARY_PASSWORD, CANARY_B2_ID, CANARY_B2_KEY);
+
+  // Helper: build a per-method fake binary with its own call-count and canary logic.
+  async function makeCanaryBinary(dir: string): Promise<{ binary: string; callCountFile: string }> {
+    const binary = `${dir}/fake-restic`;
+    const callCountFile = `${dir}/call-count`;
+    await Deno.writeTextFile(
+      binary,
+      `#!/bin/sh
+COUNT=0
+if [ -f "${callCountFile}" ]; then COUNT=$(cat "${callCountFile}"); fi
+COUNT=$((COUNT + 1))
+printf '%s' "$COUNT" > "${callCountFile}"
+# Call 1: version probe — return valid version JSON so the probe PASSES
+if [ "$COUNT" -eq 1 ]; then
+  echo '{"message_type":"version","version":"0.18.0","go_version":"go1.21","go_os":"linux","go_arch":"amd64"}'
+  exit 0
+fi
+# Calls 2+: method's own command — echo canaries and fail
 echo '{"message_type":"exit_error","message":"auth error: ${CANARY_PASSWORD} ${CANARY_B2_ID} ${CANARY_B2_KEY}","code":1}'
-echo "stderr: ${CANARY_PASSWORD} ${CANARY_B2_ID} ${CANARY_B2_KEY}" >&2
+printf 'stderr: ${CANARY_PASSWORD} ${CANARY_B2_ID} ${CANARY_B2_KEY}' >&2
 exit 1
 `,
-  );
-  await Deno.chmod(fakeBinary, 0o755);
+    );
+    await Deno.chmod(binary, 0o755);
+    return { binary, callCountFile };
+  }
 
-  /** Helper: assert no canary value appears in the string. */
-  function assertNoCanary(message: string, label: string): void {
+  // Helper: assert the call count file shows at least N calls (meaning the method branch ran).
+  async function assertCallCountAtLeast(callCountFile: string, minCalls: number, label: string): Promise<void> {
+    const countStr = await Deno.readTextFile(callCountFile).catch(() => "0");
+    const count = parseInt(countStr.trim(), 10);
     assertEquals(
-      message.includes(CANARY_PASSWORD),
-      false,
-      `${label}: CANARY_PASSWORD must not appear in error message — got: ${message}`,
-    );
-    assertEquals(
-      message.includes(CANARY_B2_ID),
-      false,
-      `${label}: CANARY_B2_ID must not appear in error message — got: ${message}`,
-    );
-    assertEquals(
-      message.includes(CANARY_B2_KEY),
-      false,
-      `${label}: CANARY_B2_KEY must not appear in error message — got: ${message}`,
+      count >= minCalls,
+      true,
+      `${label}: expected at least ${minCalls} calls to fake binary (probe + method), got ${count}`,
     );
   }
 
-  try {
-    const baseArgs = {
-      repository: `${tmpDir}/nonexistent-repo`,
-      repoDir,
-      resticPath: fakeBinary,
-      resticPassword: CANARY_PASSWORD,
-      b2AccountId: CANARY_B2_ID,
-      b2AccountKey: CANARY_B2_KEY,
-    };
-
-    // init: fake restic exits 1 on the cat-config probe → proceeds to init → fake exits 1
-    {
-      const { context } = makeContext(baseArgs);
+  // init: probe (call 1, version) passes; cat-config probe (call 2) fails with canaries;
+  //        init itself (call 3) also fails. We just need call 2+ to reach the method branch.
+  {
+    const dir = await Deno.makeTempDir({ prefix: "swamp-r2a-init-" });
+    try {
+      const { binary, callCountFile } = await makeCanaryBinary(dir);
+      const { context } = makeContext({
+        repository: `${dir}/repo`,
+        repoDir: dir,
+        resticPath: binary,
+        resticPassword: CANARY_PASSWORD,
+        b2AccountId: CANARY_B2_ID,
+        b2AccountKey: CANARY_B2_KEY,
+      });
       const error = await assertRejects(() => model.methods.init.execute({}, context), Error);
+      await assertCallCountAtLeast(callCountFile, 2, "init");
       assertNoCanary(error.message, "init");
+    } finally {
+      await Deno.remove(dir, { recursive: true });
     }
+  }
 
-    // backup: fake restic exits 1 → backup failure path
-    {
-      const { context } = makeContext(baseArgs);
+  // backup: probe (call 1) passes; backup command (call 2) fails with canaries.
+  {
+    const dir = await Deno.makeTempDir({ prefix: "swamp-r2a-backup-" });
+    try {
+      const { binary, callCountFile } = await makeCanaryBinary(dir);
+      const { context } = makeContext({
+        repository: `${dir}/repo`,
+        repoDir: dir,
+        resticPath: binary,
+        resticPassword: CANARY_PASSWORD,
+        b2AccountId: CANARY_B2_ID,
+        b2AccountKey: CANARY_B2_KEY,
+      });
       const error = await assertRejects(
         () => model.methods.backup.execute({ tags: [] }, context),
         Error,
       );
+      await assertCallCountAtLeast(callCountFile, 2, "backup");
       assertNoCanary(error.message, "backup");
+    } finally {
+      await Deno.remove(dir, { recursive: true });
     }
+  }
 
-    // snapshots: fake restic exits 1 → snapshots failure path
-    {
-      const { context } = makeContext(baseArgs);
+  // snapshots: probe (call 1) passes; snapshots command (call 2) fails with canaries.
+  {
+    const dir = await Deno.makeTempDir({ prefix: "swamp-r2a-snapshots-" });
+    try {
+      const { binary, callCountFile } = await makeCanaryBinary(dir);
+      const { context } = makeContext({
+        repository: `${dir}/repo`,
+        repoDir: dir,
+        resticPath: binary,
+        resticPassword: CANARY_PASSWORD,
+        b2AccountId: CANARY_B2_ID,
+        b2AccountKey: CANARY_B2_KEY,
+      });
       const error = await assertRejects(
         () => model.methods.snapshots.execute({ tags: [] }, context),
         Error,
       );
+      await assertCallCountAtLeast(callCountFile, 2, "snapshots");
       assertNoCanary(error.message, "snapshots");
+    } finally {
+      await Deno.remove(dir, { recursive: true });
     }
+  }
 
-    // restore: fake restic exits 1 → restore failure path (safe targetDir to pass safety check)
-    {
-      const stagingDir = await Deno.makeTempDir({ prefix: "swamp-r2-restore-" });
-      try {
-        const { context } = makeContext(baseArgs);
-        const error = await assertRejects(
-          () => model.methods.restore.execute(
-            { snapshot: "latest", targetDir: stagingDir, confirm: false },
-            context,
-          ),
-          Error,
-        );
-        assertNoCanary(error.message, "restore");
-      } finally {
-        await Deno.remove(stagingDir, { recursive: true });
-      }
+  // restore: probe (call 1) passes; restore command (call 2) fails with canaries.
+  {
+    const dir = await Deno.makeTempDir({ prefix: "swamp-r2a-restore-" });
+    const stagingDir = await Deno.makeTempDir({ prefix: "swamp-r2a-restore-staging-" });
+    try {
+      const { binary, callCountFile } = await makeCanaryBinary(dir);
+      const { context } = makeContext({
+        repository: `${dir}/repo`,
+        repoDir: dir,
+        resticPath: binary,
+        resticPassword: CANARY_PASSWORD,
+        b2AccountId: CANARY_B2_ID,
+        b2AccountKey: CANARY_B2_KEY,
+      });
+      const error = await assertRejects(
+        () => model.methods.restore.execute(
+          { snapshot: "latest", targetDir: stagingDir, confirm: false },
+          context,
+        ),
+        Error,
+      );
+      await assertCallCountAtLeast(callCountFile, 2, "restore");
+      assertNoCanary(error.message, "restore");
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+      await Deno.remove(stagingDir, { recursive: true });
     }
+  }
 
-    // forget: fake restic exits 1 → forget failure path
-    {
-      const { context } = makeContext(baseArgs);
+  // forget: probe (call 1) passes; forget command (call 2) fails with canaries.
+  {
+    const dir = await Deno.makeTempDir({ prefix: "swamp-r2a-forget-" });
+    try {
+      const { binary, callCountFile } = await makeCanaryBinary(dir);
+      const { context } = makeContext({
+        repository: `${dir}/repo`,
+        repoDir: dir,
+        resticPath: binary,
+        resticPassword: CANARY_PASSWORD,
+        b2AccountId: CANARY_B2_ID,
+        b2AccountKey: CANARY_B2_KEY,
+      });
       const error = await assertRejects(
         () => model.methods.forget.execute({ keepLast: 3, dryRun: false }, context),
         Error,
       );
+      await assertCallCountAtLeast(callCountFile, 2, "forget");
       assertNoCanary(error.message, "forget");
+    } finally {
+      await Deno.remove(dir, { recursive: true });
     }
+  }
 
-    // prune: fake restic exits 1 → prune failure path
-    {
-      const { context } = makeContext(baseArgs);
+  // prune: probe (call 1) passes; prune command (call 2) fails with canaries.
+  {
+    const dir = await Deno.makeTempDir({ prefix: "swamp-r2a-prune-" });
+    try {
+      const { binary, callCountFile } = await makeCanaryBinary(dir);
+      const { context } = makeContext({
+        repository: `${dir}/repo`,
+        repoDir: dir,
+        resticPath: binary,
+        resticPassword: CANARY_PASSWORD,
+        b2AccountId: CANARY_B2_ID,
+        b2AccountKey: CANARY_B2_KEY,
+      });
       const error = await assertRejects(
         () => model.methods.prune.execute({}, context),
         Error,
       );
+      await assertCallCountAtLeast(callCountFile, 2, "prune");
       assertNoCanary(error.message, "prune");
+    } finally {
+      await Deno.remove(dir, { recursive: true });
     }
-  } finally {
-    await Deno.remove(tmpDir, { recursive: true });
+  }
+});
+
+Deno.test("R2b: malformed-success-output — secrets absent from thrown errors when restic exits 0 with invalid JSON", async () => {
+  // A fake binary that exits 0 but emits invalid JSON containing canary values.
+  // The model must throw a sanitised error that contains none of the canaries.
+  // This tests the redacting-catch wrappers added around every success-path JSON.parse.
+
+  const CANARY_PASSWORD = "CANARY_R2B_PASSWORD_aB3cD4_MUST_NOT_LEAK";
+  const CANARY_B2_ID = "CANARY_R2B_B2_ID_eF5gH6_MUST_NOT_LEAK";
+  const CANARY_B2_KEY = "CANARY_R2B_B2_KEY_iJ7kL8_MUST_NOT_LEAK";
+
+  const assertNoCanary = (msg: string, label: string) =>
+    assertNoCanaryInMessage(msg, label, CANARY_PASSWORD, CANARY_B2_ID, CANARY_B2_KEY);
+
+  // Helper: a fake binary where:
+  //   call 1 (version --json): valid version JSON → probe passes
+  //   calls 2+: exits 0 with INVALID JSON containing canary values
+  async function makeMalformedSuccessBinary(dir: string): Promise<string> {
+    const binary = `${dir}/fake-restic`;
+    const callCountFile = `${dir}/call-count`;
+    await Deno.writeTextFile(
+      binary,
+      `#!/bin/sh
+COUNT=0
+if [ -f "${callCountFile}" ]; then COUNT=$(cat "${callCountFile}"); fi
+COUNT=$((COUNT + 1))
+printf '%s' "$COUNT" > "${callCountFile}"
+if [ "$COUNT" -eq 1 ]; then
+  echo '{"message_type":"version","version":"0.18.0","go_version":"go1.21","go_os":"linux","go_arch":"amd64"}'
+  exit 0
+fi
+# Exit 0 but emit invalid JSON containing canary values — simulates buggy binary
+printf 'NOTJSON: ${CANARY_PASSWORD} ${CANARY_B2_ID} ${CANARY_B2_KEY}'
+exit 0
+`,
+    );
+    await Deno.chmod(binary, 0o755);
+    return binary;
+  }
+
+  // init: the binary must:
+  //   call 1 (version): valid JSON → probe passes
+  //   call 2 (cat config): exit 1 → repo not yet initialized (proceed to init)
+  //   call 3 (restic init): exit 0 + INVALID JSON with canaries → parse branch catches it
+  {
+    const dir = await Deno.makeTempDir({ prefix: "swamp-r2b-init-" });
+    try {
+      const binary = `${dir}/fake-restic`;
+      const callCountFile = `${dir}/call-count`;
+      await Deno.writeTextFile(
+        binary,
+        `#!/bin/sh
+COUNT=0
+if [ -f "${callCountFile}" ]; then COUNT=$(cat "${callCountFile}"); fi
+COUNT=$((COUNT + 1))
+printf '%s' "$COUNT" > "${callCountFile}"
+if [ "$COUNT" -eq 1 ]; then
+  echo '{"message_type":"version","version":"0.18.0","go_version":"go1.21","go_os":"linux","go_arch":"amd64"}'
+  exit 0
+fi
+if [ "$COUNT" -eq 2 ]; then
+  printf 'cat-config-error'
+  exit 1
+fi
+# Call 3+: restic init exits 0 but emits invalid JSON containing canaries
+printf 'NOTJSON_INIT: ${CANARY_PASSWORD} ${CANARY_B2_ID} ${CANARY_B2_KEY}'
+exit 0
+`,
+      );
+      await Deno.chmod(binary, 0o755);
+      const { context } = makeContext({
+        repository: `${dir}/repo`,
+        repoDir: dir,
+        resticPath: binary,
+        resticPassword: CANARY_PASSWORD,
+        b2AccountId: CANARY_B2_ID,
+        b2AccountKey: CANARY_B2_KEY,
+      });
+      // After probe passes and cat-config fails, init runs and exits 0 with invalid JSON.
+      // The thrown error must not expose canaries.
+      const error = await assertRejects(() => model.methods.init.execute({}, context), Error);
+      assertNoCanary(error.message, "init malformed success");
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  }
+
+  // backup: exits 0 with invalid JSONL → findJsonlMessage throws → sanitised error.
+  {
+    const dir = await Deno.makeTempDir({ prefix: "swamp-r2b-backup-" });
+    try {
+      const binary = await makeMalformedSuccessBinary(dir);
+      const { context } = makeContext({
+        repository: `${dir}/repo`,
+        repoDir: dir,
+        resticPath: binary,
+        resticPassword: CANARY_PASSWORD,
+        b2AccountId: CANARY_B2_ID,
+        b2AccountKey: CANARY_B2_KEY,
+      });
+      const error = await assertRejects(
+        () => model.methods.backup.execute({ tags: [] }, context),
+        Error,
+      );
+      assertNoCanary(error.message, "backup malformed success");
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  }
+
+  // snapshots: exits 0 with invalid JSON → JSON.parse throws → sanitised error.
+  {
+    const dir = await Deno.makeTempDir({ prefix: "swamp-r2b-snapshots-" });
+    try {
+      const binary = await makeMalformedSuccessBinary(dir);
+      const { context } = makeContext({
+        repository: `${dir}/repo`,
+        repoDir: dir,
+        resticPath: binary,
+        resticPassword: CANARY_PASSWORD,
+        b2AccountId: CANARY_B2_ID,
+        b2AccountKey: CANARY_B2_KEY,
+      });
+      const error = await assertRejects(
+        () => model.methods.snapshots.execute({ tags: [] }, context),
+        Error,
+      );
+      assertNoCanary(error.message, "snapshots malformed success");
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  }
+
+  // forget: exits 0 with invalid JSON → JSON.parse throws → sanitised error.
+  {
+    const dir = await Deno.makeTempDir({ prefix: "swamp-r2b-forget-" });
+    try {
+      const binary = await makeMalformedSuccessBinary(dir);
+      const { context } = makeContext({
+        repository: `${dir}/repo`,
+        repoDir: dir,
+        resticPath: binary,
+        resticPassword: CANARY_PASSWORD,
+        b2AccountId: CANARY_B2_ID,
+        b2AccountKey: CANARY_B2_KEY,
+      });
+      const error = await assertRejects(
+        () => model.methods.forget.execute({ keepLast: 3, dryRun: false }, context),
+        Error,
+      );
+      assertNoCanary(error.message, "forget malformed success");
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
   }
 });
 
