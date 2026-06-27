@@ -584,16 +584,30 @@ Deno.test("S3: prune uses --json flag (even though restic emits no JSON for prun
 // S3: No human-text parser path reachable
 // =============================================================================
 
-Deno.test("S3: parseResticJsonOutput throws SyntaxError on non-JSON input (no silent fallback)", () => {
-  // The invoker always calls parseResticJsonOutput or findJsonlMessage, both of
-  // which throw SyntaxError on invalid JSON. There is no silent return-empty path.
+Deno.test("S3/R3-LOW-003: parseResticJsonOutput throws sanitized Error on non-JSON input (no raw input in message, no silent fallback)", () => {
+  // parseResticJsonOutput must throw a sanitized domain Error — NOT a raw SyntaxError
+  // that could embed an input snippet containing reflected secrets.
+  // The no-human-text-parser invariant requires that malformed subprocess output is
+  // rejected with a fixed message that does not include any raw input.
+  const RAW_INPUT = "This is not JSON at all — SENSITIVE_CANARY_VALUE_XK9M";
   let threw = false;
   try {
-    parseResticJsonOutput("This is not JSON at all");
+    parseResticJsonOutput(RAW_INPUT);
   } catch (err) {
     threw = true;
-    // Must be a JSON parse error, not a custom swallowing of non-JSON
-    assertEquals(err instanceof SyntaxError, true, "Must throw SyntaxError on non-JSON input");
+    // Must be a plain Error (domain error), NOT a SyntaxError with raw input embedded
+    assertEquals(err instanceof Error, true, "Must throw Error on non-JSON input");
+    // The raw input (including any canary/secret it might contain) must NOT appear in the message
+    assertEquals(
+      (err as Error).message.includes(RAW_INPUT),
+      false,
+      "Raw input must NOT appear in the sanitized error message",
+    );
+    assertEquals(
+      (err as Error).message.includes("SENSITIVE_CANARY_VALUE_XK9M"),
+      false,
+      "Canary value from raw input must NOT appear in the sanitized error message",
+    );
   }
   assertEquals(threw, true, "parseResticJsonOutput must throw on non-JSON input");
 });
@@ -1927,6 +1941,54 @@ exit 1
       await Deno.remove(dir, { recursive: true });
     }
   }
+
+  // check: probe (call 1) passes; check command (call 2) fails with canaries.
+  {
+    const dir = await Deno.makeTempDir({ prefix: "swamp-r2a-check-" });
+    try {
+      const { binary, callCountFile } = await makeCanaryBinary(dir);
+      const { context } = makeContext({
+        repository: `${dir}/repo`,
+        repoDir: dir,
+        resticPath: binary,
+        resticPassword: CANARY_PASSWORD,
+        b2AccountId: CANARY_B2_ID,
+        b2AccountKey: CANARY_B2_KEY,
+      });
+      // check exits non-zero (canary binary) → check's own failure handling is reached.
+      // check doesn't throw on non-zero exit — it writes ok:false to the resource.
+      // So we assert no canary appears in the written resource data either.
+      const { context: ctx2, writes } = makeContext({
+        repository: `${dir}/repo`,
+        repoDir: dir,
+        resticPath: binary,
+        resticPassword: CANARY_PASSWORD,
+        b2AccountId: CANARY_B2_ID,
+        b2AccountKey: CANARY_B2_KEY,
+      });
+      await model.methods.check.execute({}, ctx2);
+      await assertCallCountAtLeast(callCountFile, 2, "check");
+      // Verify no canary values in the written checkResult resource
+      const resourceJson = JSON.stringify(writes[0]?.data ?? {});
+      assertEquals(
+        resourceJson.includes(CANARY_PASSWORD),
+        false,
+        "check: CANARY_PASSWORD must not appear in checkResult resource",
+      );
+      assertEquals(
+        resourceJson.includes(CANARY_B2_ID),
+        false,
+        "check: CANARY_B2_ID must not appear in checkResult resource",
+      );
+      assertEquals(
+        resourceJson.includes(CANARY_B2_KEY),
+        false,
+        "check: CANARY_B2_KEY must not appear in checkResult resource",
+      );
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  }
 });
 
 Deno.test("R2b: malformed-success-output — secrets absent from thrown errors when restic exits 0 with invalid JSON", async () => {
@@ -2080,6 +2142,59 @@ exit 0
       assertNoCanary(error.message, "forget malformed success");
     } finally {
       await Deno.remove(dir, { recursive: true });
+    }
+  }
+
+  // check: exits 0 with non-empty invalid JSON → R3-MEDIUM-001 fix makes it throw.
+  // (R3-MEDIUM-001: non-empty malformed exit-0 stdout must throw a sanitized error,
+  //  consistent with the invariant applied to init/backup/snapshots/forget.)
+  {
+    const dir = await Deno.makeTempDir({ prefix: "swamp-r2b-check-" });
+    try {
+      const binary = await makeMalformedSuccessBinary(dir);
+      const { context } = makeContext({
+        repository: `${dir}/repo`,
+        repoDir: dir,
+        resticPath: binary,
+        resticPassword: CANARY_PASSWORD,
+        b2AccountId: CANARY_B2_ID,
+        b2AccountKey: CANARY_B2_KEY,
+      });
+      const error = await assertRejects(
+        () => model.methods.check.execute({}, context),
+        Error,
+      );
+      assertNoCanary(error.message, "check malformed success");
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  }
+
+  // restore: exits 0 with non-empty invalid JSON → R3-MEDIUM-001 fix makes it throw.
+  {
+    const dir = await Deno.makeTempDir({ prefix: "swamp-r2b-restore-" });
+    const stagingDir = await Deno.makeTempDir({ prefix: "swamp-r2b-restore-staging-" });
+    try {
+      const binary = await makeMalformedSuccessBinary(dir);
+      const { context } = makeContext({
+        repository: `${dir}/repo`,
+        repoDir: dir,
+        resticPath: binary,
+        resticPassword: CANARY_PASSWORD,
+        b2AccountId: CANARY_B2_ID,
+        b2AccountKey: CANARY_B2_KEY,
+      });
+      const error = await assertRejects(
+        () => model.methods.restore.execute(
+          { snapshot: "latest", targetDir: stagingDir, confirm: false },
+          context,
+        ),
+        Error,
+      );
+      assertNoCanary(error.message, "restore malformed success");
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+      await Deno.remove(stagingDir, { recursive: true });
     }
   }
 });

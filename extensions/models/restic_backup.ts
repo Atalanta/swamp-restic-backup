@@ -442,8 +442,11 @@ async function invokeResticNoSecrets(
  * Parse the JSON output from a restic command.
  * Restic with --json emits one JSON object per line (JSONL) for streaming
  * commands, or a single JSON array/object for listing commands.
- * This function throws a SyntaxError if the last non-empty line is not valid JSON,
- * which is the intended behavior — there is NO human-text fallback path.
+ *
+ * Throws a sanitized domain Error (never a raw SyntaxError) on invalid input —
+ * the no-human-text-parser invariant requires that malformed subprocess output
+ * is rejected cleanly without embedding raw input snippets in the error message,
+ * which could expose reflected secrets.
  */
 function parseResticJsonOutput(stdout: string): unknown {
   const trimmed = stdout.trim();
@@ -458,9 +461,21 @@ function parseResticJsonOutput(stdout: string): unknown {
     // Fall through to JSONL parsing
   }
 
-  // Parse as JSONL — return all lines as an array
+  // Parse as JSONL — return all lines as an array.
+  // Any line that fails JSON.parse causes a sanitized domain error rather than
+  // propagating a raw SyntaxError that could embed an input snippet.
   const lines = trimmed.split("\n").filter((line) => line.trim() !== "");
-  return lines.map((line) => JSON.parse(line));
+  const results: unknown[] = [];
+  for (const line of lines) {
+    try {
+      results.push(JSON.parse(line));
+    } catch {
+      throw new Error(
+        "restic --json output contained a line that is not valid JSON — no human-text fallback",
+      );
+    }
+  }
+  return results;
 }
 
 /**
@@ -1218,11 +1233,18 @@ export const model = {
         // check --json emits a summary JSONL line
         // exit 0 = ok, exit non-zero = errors found.
         // Wrap in a redacting catch: malformed-but-exit-0 stdout could embed secrets.
+        // Non-empty-but-unparseable stdout is a hard error (consistent with the
+        // invariant that every success-path parse throws a sanitized error on failure).
+        // Empty stdout is legitimately possible if restic emits nothing (non-fatal).
         let summary: Record<string, unknown> | null;
         try {
           summary = findJsonlMessage(result.stdout, "summary");
         } catch {
-          // check doesn't need a summary to report errors — treat as no summary found.
+          if (result.stdout.trim() !== "") {
+            throw new Error(
+              "restic check --json exited 0 but emitted invalid JSON — cannot parse result",
+            );
+          }
           summary = null;
         }
 
@@ -1351,11 +1373,18 @@ export const model = {
         }
 
         // Wrap in a redacting catch: malformed-but-exit-0 stdout could embed secrets.
+        // Non-empty-but-unparseable stdout is a hard error (consistent with the
+        // invariant that every success-path parse throws a sanitized error on failure).
+        // Empty stdout means restic emitted no summary (tolerated — counts default to 0).
         let summary: Record<string, unknown> | null;
         try {
           summary = findJsonlMessage(result.stdout, "summary");
         } catch {
-          // Missing summary is non-fatal for restore — files were written; counts default to 0.
+          if (result.stdout.trim() !== "") {
+            throw new Error(
+              "restic restore --json exited 0 but emitted invalid JSON — cannot parse result",
+            );
+          }
           summary = null;
         }
 
