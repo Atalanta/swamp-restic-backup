@@ -620,14 +620,32 @@ async function resolvePathWithAncestor(rawPath: string, cwd: string): Promise<st
 async function checkRestoreTargetSafety(
   targetDir: string,
   repoDir: string,
+  // Anchor used to absolutize a relative repoDir (defaults to the process cwd).
+  // Injectable so tests can drive the default repoDir='.' resolution path
+  // deterministically without mutating the real process working directory.
+  cwdAnchor: string = Deno.cwd(),
 ): Promise<string | null> {
   if (!targetDir || targetDir.trim() === "") {
     return "targetDir is required for restore — specify an explicit directory to restore into";
   }
 
-  // Resolve both paths fully, including through symlinks and ../  segments.
-  const resolvedTarget = await resolvePathWithAncestor(targetDir, repoDir);
-  const resolvedRepo = await resolvePathWithAncestor(repoDir, repoDir);
+  // Resolve repoDir to a real absolute path FIRST.
+  // repoDir defaults to '.' in globalArgs; if we skip this step, a relative
+  // repoDir produces resolvedSwampDir = '/.swamp' (or some other wrong root),
+  // allowing an absolute targetDir inside the ACTUAL .swamp/ to pass unchecked.
+  // We must anchor everything to the actual working directory before comparisons.
+  const absoluteRepoDir = repoDir.startsWith("/")
+    ? repoDir
+    : `${cwdAnchor}/${repoDir}`;
+  let resolvedRepo: string;
+  try {
+    resolvedRepo = await Deno.realPath(absoluteRepoDir);
+  } catch {
+    resolvedRepo = normalizePosixPath(absoluteRepoDir);
+  }
+
+  // Resolve targetDir against the now-absolute resolvedRepo as cwd.
+  const resolvedTarget = await resolvePathWithAncestor(targetDir, resolvedRepo);
   const resolvedSwampDir = `${resolvedRepo}/.swamp`;
 
   // (a) equals repo root
@@ -809,7 +827,7 @@ export const model = {
         const probe = await probeResticCapability(resticPath, cwd);
         if (!probe.supported) {
           throw new Error(
-            `restic does not support --json: ${probe.message}`,
+            `restic does not support --json: ${redactSecrets(probe.message, secrets)}`,
           );
         }
 
@@ -872,11 +890,16 @@ export const model = {
         } else {
           // init failed — surface the JSON error message if available, otherwise stderr.
           // We do NOT classify the error by message text; all non-zero exits are failures.
+          // Apply redactSecrets before including any subprocess output in the thrown error
+          // to prevent accidental secret reflection into logs or error messages.
           const errorJsonSource = result.stdout.trim() || result.stderr.trim();
-          let errorDetail = result.stderr.slice(0, 300);
+          let errorDetail = redactSecrets(result.stderr.slice(0, 300), secrets);
           try {
             const errorParsed = JSON.parse(errorJsonSource) as Record<string, unknown>;
-            errorDetail = (errorParsed["message"] as string) ?? errorDetail;
+            errorDetail = redactSecrets(
+              (errorParsed["message"] as string) ?? result.stderr.slice(0, 300),
+              secrets,
+            );
           } catch { /* keep stderr fallback */ }
           throw new Error(
             `restic init failed (exit ${result.exitCode}): ${errorDetail}`,
@@ -922,7 +945,7 @@ export const model = {
         const probe = await probeResticCapability(resticPath, cwd);
         if (!probe.supported) {
           throw new Error(
-            `restic does not support --json: ${probe.message}`,
+            `restic does not support --json: ${redactSecrets(probe.message, secrets)}`,
           );
         }
 
@@ -949,12 +972,16 @@ export const model = {
         const result = await invokeRestic(argv, secrets, cwd);
 
         if (!result.success) {
+          // Redact secrets from any subprocess-derived text before including in the error.
           const errorMsg = (() => {
             try {
               const parsed = JSON.parse(result.stdout.trim()) as Record<string, unknown>;
-              return (parsed["message"] as string) ?? result.stderr.slice(0, 300);
+              return redactSecrets(
+                (parsed["message"] as string) ?? result.stderr.slice(0, 300),
+                secrets,
+              );
             } catch {
-              return result.stderr.slice(0, 300);
+              return redactSecrets(result.stderr.slice(0, 300), secrets);
             }
           })();
           throw new Error(
@@ -1035,7 +1062,7 @@ export const model = {
         const probe = await probeResticCapability(resticPath, cwd);
         if (!probe.supported) {
           throw new Error(
-            `restic does not support --json: ${probe.message}`,
+            `restic does not support --json: ${redactSecrets(probe.message, secrets)}`,
           );
         }
 
@@ -1054,7 +1081,7 @@ export const model = {
 
         if (!result.success) {
           throw new Error(
-            `restic snapshots failed (exit ${result.exitCode}): ${result.stderr.slice(0, 200)}`,
+            `restic snapshots failed (exit ${result.exitCode}): ${redactSecrets(result.stderr.slice(0, 200), secrets)}`,
           );
         }
 
@@ -1125,7 +1152,7 @@ export const model = {
         const probe = await probeResticCapability(resticPath, cwd);
         if (!probe.supported) {
           throw new Error(
-            `restic does not support --json: ${probe.message}`,
+            `restic does not support --json: ${redactSecrets(probe.message, secrets)}`,
           );
         }
 
@@ -1142,7 +1169,8 @@ export const model = {
         const numErrors = (summary?.["num_errors"] as number) ?? 0;
         const ok = result.success && numErrors === 0;
 
-        // Collect any error lines (message_type=error) from the JSONL output
+        // Collect any error lines (message_type=error) from the JSONL output.
+        // Defensively redact secrets from message text before persisting to resource.
         const errorLines = result.stdout
           .trim()
           .split("\n")
@@ -1151,7 +1179,8 @@ export const model = {
             try {
               const parsed = JSON.parse(line) as Record<string, unknown>;
               if (parsed["message_type"] === "error") {
-                return [(parsed["message"] as string) ?? line];
+                const rawMsg = (parsed["message"] as string) ?? line;
+                return [redactSecrets(rawMsg, secrets)];
               }
               return [];
             } catch {
@@ -1224,7 +1253,7 @@ export const model = {
         const probe = await probeResticCapability(resticPath, cwd);
         if (!probe.supported) {
           throw new Error(
-            `restic does not support --json: ${probe.message}`,
+            `restic does not support --json: ${redactSecrets(probe.message, secrets)}`,
           );
         }
 
@@ -1244,12 +1273,16 @@ export const model = {
         );
 
         if (!result.success) {
+          // Redact secrets from any subprocess-derived text before including in the error.
           const errorMsg = (() => {
             try {
               const parsed = JSON.parse(result.stdout.trim()) as Record<string, unknown>;
-              return (parsed["message"] as string) ?? result.stderr.slice(0, 300);
+              return redactSecrets(
+                (parsed["message"] as string) ?? result.stderr.slice(0, 300),
+                secrets,
+              );
             } catch {
-              return result.stderr.slice(0, 300);
+              return redactSecrets(result.stderr.slice(0, 300), secrets);
             }
           })();
           throw new Error(
@@ -1312,7 +1345,7 @@ export const model = {
         const probe = await probeResticCapability(resticPath, cwd);
         if (!probe.supported) {
           throw new Error(
-            `restic does not support --json: ${probe.message}`,
+            `restic does not support --json: ${redactSecrets(probe.message, secrets)}`,
           );
         }
 
@@ -1335,7 +1368,7 @@ export const model = {
 
         if (!result.success) {
           throw new Error(
-            `restic forget failed (exit ${result.exitCode}): ${result.stderr.slice(0, 200)}`,
+            `restic forget failed (exit ${result.exitCode}): ${redactSecrets(result.stderr.slice(0, 200), secrets)}`,
           );
         }
 
@@ -1399,7 +1432,7 @@ export const model = {
         const probe = await probeResticCapability(resticPath, cwd);
         if (!probe.supported) {
           throw new Error(
-            `restic does not support --json: ${probe.message}`,
+            `restic does not support --json: ${redactSecrets(probe.message, secrets)}`,
           );
         }
 
@@ -1412,9 +1445,11 @@ export const model = {
         const durationMs = Math.round(performance.now() - startTime);
 
         if (!result.success) {
-          // prune may exit non-zero even on partial success; check stderr
+          // prune may exit non-zero even on partial success; check stderr.
+          // Redact secrets defensively — restic reads them from env, not args,
+          // but belt-and-suspenders for any accidental reflection in diagnostic output.
           throw new Error(
-            `restic prune failed (exit ${result.exitCode}): ${result.stderr.slice(0, 200)}`,
+            `restic prune failed (exit ${result.exitCode}): ${redactSecrets(result.stderr.slice(0, 200), secrets)}`,
           );
         }
 
@@ -1457,4 +1492,4 @@ export const model = {
 // parseResticJsonOutput is not called by the model methods directly (they use
 // findJsonlMessage or inline JSON.parse for their specific shapes), but it is
 // exported for use in tests that verify the no-human-text-parser invariant.
-export { parseResticJsonOutput };
+export { checkRestoreTargetSafety, parseResticJsonOutput };

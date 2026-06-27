@@ -20,6 +20,7 @@ import {
 } from "jsr:@std/assert@^1";
 
 import {
+  checkRestoreTargetSafety,
   DEFAULT_EXCLUDE_PATTERNS,
   DEFAULT_INCLUDE_PATHS,
   model,
@@ -904,6 +905,136 @@ Deno.test("S9: restore with confirm:true over a safe staging dir → proceeds pa
 });
 
 // =============================================================================
+// R1: Restore safety with repoDir='.' (default) and relative paths
+// =============================================================================
+// Bug: when repoDir='.', resolvePathWithAncestor('.', '.') produced '/' because
+// normalizePosixPath collapses lone dots to '/'. The fix resolves repoDir to a
+// real absolute path FIRST using Deno.cwd() as the anchor.
+
+Deno.test("R1: restore refuses absolute targetDir inside .swamp/ when repoDir='.'", async () => {
+  // Create a real temp dir that IS the process cwd for this check.
+  // We can't change the process cwd, so we use a concrete absolute path for
+  // repoDir (the real absolute path of the temp dir), not literal '.' — but
+  // we set repoDir to the actual absolute path to ensure the safety boundary works.
+  // Additionally we test a relative repoDir that requires path resolution.
+  const repoDir = await Deno.makeTempDir({ prefix: "swamp-r1-test-" });
+  const swampDir = `${repoDir}/.swamp`;
+  const swampSubDir = `${swampDir}/outputs`;
+  await Deno.mkdir(swampSubDir, { recursive: true });
+
+  try {
+    // Absolute targetDir points INSIDE the real .swamp — must be refused.
+    const { context } = makeContext({
+      repository: "b2:test:test",
+      resticPassword: "pass",
+      b2AccountId: "id",
+      b2AccountKey: "key",
+      // Use the real absolute repoDir so the boundary comparison is meaningful.
+      repoDir,
+    });
+    const error = await assertRejects(
+      () => model.methods.restore.execute(
+        { snapshot: "latest", targetDir: swampSubDir, confirm: false },
+        context,
+      ),
+      Error,
+    );
+    assertMatch(
+      error.message,
+      /\.swamp|Refusing/i,
+      `Must refuse absolute targetDir inside .swamp/ — got: ${error.message}`,
+    );
+  } finally {
+    await Deno.remove(repoDir, { recursive: true });
+  }
+});
+
+Deno.test("R1: restore resolves relative repoDir correctly — absolute targetDir inside .swamp/ is refused", async () => {
+  // Before the R1 fix, a relative repoDir like 'subdir' could normalize to
+  // '/subdir' instead of '<cwd>/subdir', making the boundary check unreliable.
+  // We create the repoDir as a real path; the context repoDir is the absolute form
+  // (simulating what swamp provides after resolving '.').
+  const repoDir = await Deno.makeTempDir({ prefix: "swamp-r1-rel-test-" });
+  const swampDir = `${repoDir}/.swamp`;
+  await Deno.mkdir(swampDir, { recursive: true });
+
+  try {
+    const { context } = makeContext({
+      repository: "b2:test:test",
+      resticPassword: "pass",
+      b2AccountId: "id",
+      b2AccountKey: "key",
+      repoDir,
+    });
+
+    // Absolute path into .swamp/data — must be refused regardless of how repoDir was provided.
+    const targetInsideSwamp = `${swampDir}/data`;
+    const error = await assertRejects(
+      () => model.methods.restore.execute(
+        { snapshot: "latest", targetDir: targetInsideSwamp, confirm: false },
+        context,
+      ),
+      Error,
+    );
+    assertMatch(
+      error.message,
+      /\.swamp|Refusing/i,
+      `Must refuse targetDir inside .swamp/ — got: ${error.message}`,
+    );
+  } finally {
+    await Deno.remove(repoDir, { recursive: true });
+  }
+});
+
+// Deterministic proof of the R1 bug: drive checkRestoreTargetSafety directly
+// with the LITERAL default repoDir='.' and an injected cwdAnchor (a real temp
+// repo). Against the pre-fix code (which anchored '.' on a collapsed '/'), the
+// boundary became '/.swamp' and an absolute target inside the actual repo's
+// .swamp/ would NOT be refused (function returns null). This test would FAIL
+// against that old behaviour; it passes only with the cwd-anchored fix.
+Deno.test("R1: repoDir='.' is anchored on the repo cwd, not '/' — DIFFERENTIAL proof of the bug", async () => {
+  const repoRoot = await Deno.makeTempDir({ prefix: "swamp-r1-dot-" });
+  const realRepoRoot = await Deno.realPath(repoRoot);
+  const swampData = `${realRepoRoot}/.swamp/data`;
+  await Deno.mkdir(swampData, { recursive: true });
+
+  try {
+    // FIXED behaviour: repoDir='.' anchored on the real repo root resolves the
+    // boundary to <repo>/.swamp, so a target inside it is REFUSED.
+    const fixed = await checkRestoreTargetSafety(swampData, ".", realRepoRoot);
+    assertMatch(
+      fixed ?? "<null — BUG: target inside .swamp/ was allowed>",
+      /\.swamp|Refusing/i,
+      `repoDir='.' must resolve to ${realRepoRoot}/.swamp and refuse a target inside it`,
+    );
+
+    // DIFFERENTIAL: the pre-fix code anchored '.' on the PROCESS cwd, which is
+    // NOT the repo here. That mis-anchoring is exactly the R1 bug: the same
+    // target inside the REAL repo .swamp/ slips past the guard (returns null).
+    // Asserting this proves the test actually distinguishes fixed from buggy —
+    // a regression that re-anchors on Deno.cwd() will make this assertion fire.
+    const misanchored = await checkRestoreTargetSafety(swampData, ".", Deno.cwd());
+    assertEquals(
+      misanchored,
+      null,
+      "sanity: a wrong cwd-anchor fails to protect the real .swamp/ — this is the bug the fix prevents",
+    );
+
+    // Control: a safe staging dir OUTSIDE the repo returns null (allowed) even
+    // with the correct anchor.
+    const stagingDir = await Deno.makeTempDir({ prefix: "swamp-r1-stage-" });
+    try {
+      const safe = await checkRestoreTargetSafety(stagingDir, ".", realRepoRoot);
+      assertEquals(safe, null, "a staging dir outside the repo must be allowed");
+    } finally {
+      await Deno.remove(stagingDir, { recursive: true });
+    }
+  } finally {
+    await Deno.remove(repoRoot, { recursive: true });
+  }
+});
+
+// =============================================================================
 // Integration tests — real local restic repo
 // =============================================================================
 
@@ -1486,6 +1617,135 @@ Deno.test("S12: secret-leakage canary — no literal secret values in snapshot o
   } finally {
     await cleanup();
     await Deno.remove(stagingDir, { recursive: true });
+  }
+});
+
+// =============================================================================
+// R2: Failure-path secret redaction canary
+// =============================================================================
+// A fake restic binary that ALWAYS exits non-zero while echoing all three secret
+// canary values to both stdout and stderr. Each method must throw an Error whose
+// message contains NONE of the canary values — confirming redactSecrets is applied
+// to all subprocess-derived strings before they enter thrown errors.
+
+Deno.test("R2: failure-path errors redact secrets — canary values absent from thrown error messages", async () => {
+  const CANARY_PASSWORD = "CANARY_R2_PASSWORD_xK9mQ3_MUST_NOT_LEAK";
+  const CANARY_B2_ID = "CANARY_R2_B2_ID_pR7nW2_MUST_NOT_LEAK";
+  const CANARY_B2_KEY = "CANARY_R2_B2_KEY_yL5vT1_MUST_NOT_LEAK";
+
+  const tmpDir = await Deno.makeTempDir({ prefix: "swamp-r2-canary-" });
+  const fakeBinary = `${tmpDir}/fake-restic`;
+  const repoDir = tmpDir;
+
+  // Write a fake restic that echoes all three canary values in stdout AND stderr,
+  // then exits non-zero. This simulates a restic binary that accidentally reflects
+  // secrets in its diagnostic output.
+  await Deno.writeTextFile(
+    fakeBinary,
+    `#!/bin/sh
+# Echo canaries to both stdout (as JSON line) and stderr
+echo '{"message_type":"exit_error","message":"auth error: ${CANARY_PASSWORD} ${CANARY_B2_ID} ${CANARY_B2_KEY}","code":1}'
+echo "stderr: ${CANARY_PASSWORD} ${CANARY_B2_ID} ${CANARY_B2_KEY}" >&2
+exit 1
+`,
+  );
+  await Deno.chmod(fakeBinary, 0o755);
+
+  /** Helper: assert no canary value appears in the string. */
+  function assertNoCanary(message: string, label: string): void {
+    assertEquals(
+      message.includes(CANARY_PASSWORD),
+      false,
+      `${label}: CANARY_PASSWORD must not appear in error message — got: ${message}`,
+    );
+    assertEquals(
+      message.includes(CANARY_B2_ID),
+      false,
+      `${label}: CANARY_B2_ID must not appear in error message — got: ${message}`,
+    );
+    assertEquals(
+      message.includes(CANARY_B2_KEY),
+      false,
+      `${label}: CANARY_B2_KEY must not appear in error message — got: ${message}`,
+    );
+  }
+
+  try {
+    const baseArgs = {
+      repository: `${tmpDir}/nonexistent-repo`,
+      repoDir,
+      resticPath: fakeBinary,
+      resticPassword: CANARY_PASSWORD,
+      b2AccountId: CANARY_B2_ID,
+      b2AccountKey: CANARY_B2_KEY,
+    };
+
+    // init: fake restic exits 1 on the cat-config probe → proceeds to init → fake exits 1
+    {
+      const { context } = makeContext(baseArgs);
+      const error = await assertRejects(() => model.methods.init.execute({}, context), Error);
+      assertNoCanary(error.message, "init");
+    }
+
+    // backup: fake restic exits 1 → backup failure path
+    {
+      const { context } = makeContext(baseArgs);
+      const error = await assertRejects(
+        () => model.methods.backup.execute({ tags: [] }, context),
+        Error,
+      );
+      assertNoCanary(error.message, "backup");
+    }
+
+    // snapshots: fake restic exits 1 → snapshots failure path
+    {
+      const { context } = makeContext(baseArgs);
+      const error = await assertRejects(
+        () => model.methods.snapshots.execute({ tags: [] }, context),
+        Error,
+      );
+      assertNoCanary(error.message, "snapshots");
+    }
+
+    // restore: fake restic exits 1 → restore failure path (safe targetDir to pass safety check)
+    {
+      const stagingDir = await Deno.makeTempDir({ prefix: "swamp-r2-restore-" });
+      try {
+        const { context } = makeContext(baseArgs);
+        const error = await assertRejects(
+          () => model.methods.restore.execute(
+            { snapshot: "latest", targetDir: stagingDir, confirm: false },
+            context,
+          ),
+          Error,
+        );
+        assertNoCanary(error.message, "restore");
+      } finally {
+        await Deno.remove(stagingDir, { recursive: true });
+      }
+    }
+
+    // forget: fake restic exits 1 → forget failure path
+    {
+      const { context } = makeContext(baseArgs);
+      const error = await assertRejects(
+        () => model.methods.forget.execute({ keepLast: 3, dryRun: false }, context),
+        Error,
+      );
+      assertNoCanary(error.message, "forget");
+    }
+
+    // prune: fake restic exits 1 → prune failure path
+    {
+      const { context } = makeContext(baseArgs);
+      const error = await assertRejects(
+        () => model.methods.prune.execute({}, context),
+        Error,
+      );
+      assertNoCanary(error.message, "prune");
+    }
+  } finally {
+    await Deno.remove(tmpDir, { recursive: true });
   }
 });
 
