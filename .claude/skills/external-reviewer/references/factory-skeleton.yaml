@@ -1,0 +1,197 @@
+# Generic, language-agnostic factory skeleton for @swamp/software-factory.
+#
+# This is a SKELETON, not an instance. Do NOT copy it onto disk as a model
+# instance (that would carry no fresh UUID and read as a copied instance).
+# Instead:
+#
+#   swamp model create @swamp/software-factory <your-factory>
+#   swamp model edit <your-factory>   # paste this document under globalArguments,
+#                                     # then fill the TODO placeholders
+#
+# The SHAPE (stages, transitions, gates) is reusable; the CONTENT — prompts,
+# artifact schemas, the skills each stage loads, and the build/test command — is
+# irreducibly per-project and left as TODO.
+#
+# Graph:
+#   architecture -> planning -> plan-review -> implementing -> testing
+#                -> code-review -> done   (rework edges loop back)
+#
+# How review stages use this bundle: plan-review and code-review run with
+# `mode: dispatch`. The DRIVER (out of band, between status and advance) runs the
+# @atalanta/external-reviewer `external-review-findings` workflow, which invokes
+# an INDEPENDENT external agent and persists findings JSON on the reviewer
+# model's `invocation` resource. The driver then queries that invocation and
+# records the findings on the factory via `resolve_findings`. The findings-clear
+# gate below then evaluates them. See SKILL.md for the exact commands.
+#
+# Field shapes verified against @swamp/software-factory's authoring examples
+# (sdlc-classic.yaml): stages is a LIST; `initial`/`terminal` are booleans; work
+# mode lives under `work: { mode, skills, systemPrompt }`; gates carry their
+# parameters under `config:`.
+
+stages:
+  - id: architecture
+    initial: true
+    description: Establish the design/approach for the work item.
+    work:
+      mode: interactive
+      skills: [] # TODO: skills the agent should load for design work
+      systemPrompt: |
+        TODO: instruct the agent to produce an architecture/design artifact.
+    artifacts:
+      - name: architecture
+        schema:
+          type: object
+          # TODO: define the architecture artifact schema.
+          additionalProperties: true
+    transitions:
+      - name: submit
+        to: planning
+        gates:
+          - type: artifact-exists
+            config: { artifact: architecture }
+
+  - id: planning
+    description: Produce an implementation plan from the architecture.
+    work:
+      mode: interactive
+      skills: [] # TODO
+      systemPrompt: |
+        TODO: instruct the agent to produce a plan artifact. (Optionally author
+        the plan via the external agent with the external-review-plan-author
+        workflow instead.)
+    artifacts:
+      - name: plan
+        schema:
+          type: object
+          # TODO: define the plan artifact schema.
+          additionalProperties: true
+    transitions:
+      - name: submit
+        to: plan-review
+        gates:
+          - type: artifact-exists
+            config: { artifact: plan }
+
+  - id: plan-review
+    description: >
+      Independent adversarial review of the plan. The driver runs the
+      external-review-findings workflow (artifact: plan-review), then records the
+      returned findings via resolve_findings before advancing.
+    work:
+      mode: dispatch
+      skills: [] # TODO: review skills, if any
+      systemPrompt: |
+        TODO: this stage's findings come from the external reviewer via the
+        external-review-findings workflow. See SKILL.md.
+    artifacts:
+      - name: plan-review
+        kind: findings
+        reviews: plan
+    transitions:
+      - name: approve
+        to: implementing
+        gates:
+          - type: artifact-fresh
+            config: { artifact: plan-review, recordedThisCycle: true }
+          - type: findings-clear
+            config: { artifact: plan-review, blocking: [critical, high] }
+          - type: human-approval
+            config: { id: plan-review-approval }
+      - name: rework
+        to: planning
+
+  - id: implementing
+    description: Implement the work item per the approved plan.
+    work:
+      mode: interactive
+      skills: [] # TODO
+      systemPrompt: |
+        TODO: instruct the agent to implement the plan and record the artifacts
+        and change-request evidence below.
+    artifacts:
+      - name: change-summary
+        schema:
+          type: object
+          required: [summary]
+          properties:
+            summary: { type: string }
+    evidence:
+      - name: change-request
+        schema:
+          type: object
+          required: [branch]
+          properties:
+            branch: { type: string, minLength: 1 }
+            url: { type: string }
+    transitions:
+      - name: submit
+        to: testing
+        gates:
+          - type: evidence-recorded
+            config: { name: change-request }
+
+  - id: testing
+    description: Run the project's build/test suite; gate on a clean result.
+    work:
+      mode: workflow
+      # TODO: point this at your real build/test workflow. A repo-local
+      # command/shell model wrapped in a one-step workflow gated on exitCode == 0
+      # is the simplest option; or use a richer suite as in sdlc-classic.yaml.
+      workflow:
+        name: TODO-your-test-workflow
+        inputs:
+          ref: '${{ data.latest(self.name, "evidence-change-request").payload.branch }}'
+      resultEvidence: test-run
+    transitions:
+      - name: pass
+        to: code-review
+        gates:
+          - type: workflow-succeeded
+            config: { workflow: TODO-your-test-workflow }
+      - name: fail
+        to: implementing
+        gates:
+          - type: evidence-recorded
+            config: { name: test-run, requireField: { status: failed } }
+
+  - id: code-review
+    description: >
+      Independent adversarial review of the implementation. The driver runs the
+      external-review-findings workflow (artifact: code-review), then records the
+      returned findings via resolve_findings before advancing.
+    work:
+      mode: dispatch
+      skills: [] # TODO
+      systemPrompt: |
+        TODO: this stage's findings come from the external reviewer via the
+        external-review-findings workflow. See SKILL.md.
+    artifacts:
+      - name: code-review
+        kind: findings
+        reviews: change-summary
+    transitions:
+      - name: accept
+        to: done
+        gates:
+          - type: artifact-fresh
+            config: { artifact: code-review, recordedThisCycle: true }
+          - type: findings-clear
+            config: { artifact: code-review, blocking: [critical, high] }
+          - type: human-approval
+            config: { id: code-review-approval }
+      - name: rework
+        to: implementing
+
+  - id: done
+    terminal: true
+
+  - id: aborted
+    terminal: true
+
+globalTransitions:
+  - name: abort
+    to: aborted
+    gates:
+      - type: human-approval
+        config: { id: abort-confirmation }
