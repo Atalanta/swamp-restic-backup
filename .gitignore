@@ -19,3 +19,10 @@ node_modules/
 # Local demo artifacts (personal B2 bucket / vault — not part of the published extension)
 vaults/
 models/@atalanta/restic-backup/
+
+# Build-time model instances and the test-runner workflow (not part of the published extension)
+models/
+workflows/workflow-f1511907-67a5-44ca-9a39-95bbf9f19104.yaml
+
+# Internal build proposal (references local KB paths; not for the public repo)
+DESIGN.md
