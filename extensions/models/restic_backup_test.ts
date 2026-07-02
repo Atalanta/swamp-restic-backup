@@ -20,12 +20,12 @@ import {
 } from "jsr:@std/assert@^1";
 
 import {
-  checkRestoreTargetSafety,
   DEFAULT_EXCLUDE_PATTERNS,
   DEFAULT_INCLUDE_PATHS,
-  model,
-  parseResticJsonOutput,
-} from "./restic_backup.ts";
+} from "./_lib/policy.ts";
+import { checkRestoreTargetSafety } from "./_lib/path-safety.ts";
+import { parseResticJsonOutput } from "./_lib/invoker.ts";
+import { model } from "./restic_backup.ts";
 
 // =============================================================================
 // Test helpers and stub builders
