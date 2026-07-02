@@ -38,8 +38,13 @@ export type ResticResult = {
  * (Deno.Command's env option merges with the parent env; only clearEnv=true gives
  * a fully isolated environment.)
  * Returns the raw stdout/stderr/exitCode without parsing.
+ *
+ * Module-private: this raw primitive takes arbitrary argv/env and does NOT
+ * inject secrets. Keeping it unexported ensures the only ways to reach restic
+ * from outside this module are invokeRestic (secrets injected) and
+ * invokeResticNoSecrets — enforcing the secret-injection boundary structurally.
  */
-export async function spawnRestic(
+async function spawnRestic(
   argv: string[],
   env: Record<string, string>,
   cwd: string,

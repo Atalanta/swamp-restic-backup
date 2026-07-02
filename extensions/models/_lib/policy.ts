@@ -36,10 +36,9 @@ export const DEFAULT_EXCLUDE_PATTERNS: readonly string[] = [
   ".swamp/secrets",
 ];
 
-// Inline the minimal schema shape needed here to avoid a circular dependency
-// on schemas.ts (which doesn't exist yet at S1). At S2 schemas.ts is created
-// and restic_backup.ts re-exports GlobalArgsSchema; this module only needs the
-// include/exclude fields, so we keep the type narrow.
+// This module needs only the include/exclude fields, so it declares a narrow
+// local type rather than importing GlobalArgsSchema from schemas.ts — keeping
+// policy.ts free of a dependency on the schema module.
 type IncludeExcludeArgs = {
   include: string[];
   exclude: string[];

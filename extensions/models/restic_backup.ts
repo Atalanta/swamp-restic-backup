@@ -46,10 +46,18 @@ import {
 import {
   findJsonlMessage,
   invokeRestic,
+  parseResticJsonOutput,
   probeResticCapability,
 } from "./_lib/invoker.ts";
 
-export { checkRestoreTargetSafety, DEFAULT_EXCLUDE_PATTERNS, DEFAULT_INCLUDE_PATHS };
+// Re-export the public surface this module exposed before the _lib/ split, so
+// the extension's public API is unchanged by the refactor.
+export {
+  checkRestoreTargetSafety,
+  DEFAULT_EXCLUDE_PATTERNS,
+  DEFAULT_INCLUDE_PATHS,
+  parseResticJsonOutput,
+};
 
 // =============================================================================
 // Type Definitions
