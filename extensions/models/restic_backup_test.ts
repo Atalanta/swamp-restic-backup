@@ -26,6 +26,23 @@ import {
 import { checkRestoreTargetSafety } from "./_lib/path-safety.ts";
 import { parseResticJsonOutput } from "./_lib/invoker.ts";
 import { model } from "./restic_backup.ts";
+// Public-surface guard: the entry module must keep re-exporting the symbols it
+// exposed before the _lib/ split, so the refactor does not silently change the
+// extension's public API. Imported under a namespace so a dropped re-export is
+// a compile error caught here, not only by external consumers.
+import * as entry from "./restic_backup.ts";
+
+// =============================================================================
+// Public-surface compatibility (guards the refactor's "public API unchanged")
+// =============================================================================
+
+Deno.test("public surface: entry re-exports the pre-split public symbols", () => {
+  assertEquals(typeof entry.model, "object");
+  assertEquals(typeof entry.checkRestoreTargetSafety, "function");
+  assertEquals(typeof entry.parseResticJsonOutput, "function");
+  assertEquals(Array.isArray(entry.DEFAULT_INCLUDE_PATHS), true);
+  assertEquals(Array.isArray(entry.DEFAULT_EXCLUDE_PATTERNS), true);
+});
 
 // =============================================================================
 // Test helpers and stub builders
