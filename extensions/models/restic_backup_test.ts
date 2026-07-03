@@ -560,7 +560,7 @@ exit 0
   }
 });
 
-Deno.test("S2: vault-type abstraction — identical resolved strings from two different vault sources yield identical behaviour", async () => {
+integrationTest("S2: vault-type abstraction — identical resolved strings from two different vault sources yield identical behaviour", async () => {
   // swamp resolves vault.get expressions to plain strings before execute is called.
   // The model must behave identically regardless of which vault backend provided the values.
   // We use two different "resolved" strings (simulating two vault configurations) and
