@@ -2749,6 +2749,89 @@ exit 1
   }
 });
 
+// CORR-1 / ARCH-1: check that EXITS 0 but produces no valid check summary must
+// fail at the boundary before writeResource, not silently default to ok:true.
+// (exit 0 without a parseable summary is the exact silent-default this ticket removes.)
+async function makeCheckBinary(tmpDir: string, checkStdout: string, checkExit: number): Promise<string> {
+  const callCountFile = `${tmpDir}/call-count`;
+  const fakeBinary = `${tmpDir}/fake-restic`;
+  await Deno.writeTextFile(
+    fakeBinary,
+    `#!/bin/sh
+COUNT=0
+if [ -f "${callCountFile}" ]; then COUNT=$(cat "${callCountFile}"); fi
+COUNT=$((COUNT + 1))
+printf '%s' "$COUNT" > "${callCountFile}"
+if [ "$COUNT" -eq 1 ]; then
+  echo '{"message_type":"version","version":"0.18.1","go_version":"go1.25","go_os":"darwin","go_arch":"arm64"}'
+  exit 0
+fi
+echo '${checkStdout}'
+exit ${checkExit}
+`,
+  );
+  await Deno.chmod(fakeBinary, 0o755);
+  return fakeBinary;
+}
+
+Deno.test("ISSUE-3/CORR-1: check — exit 0 with no summary line fails at boundary before writeResource", async () => {
+  const tmpDir = await Deno.makeTempDir({ prefix: "swamp-i3-check-nosummary-" });
+  try {
+    // exit 0, but only a non-summary status message — no valid check summary.
+    const fakeBinary = await makeCheckBinary(
+      tmpDir,
+      `{"message_type":"status","percent_done":1.0}`,
+      0,
+    );
+    const { context, writes } = makeContext({
+      repository: `${tmpDir}/repo`,
+      repoDir: tmpDir,
+      resticPath: fakeBinary,
+      resticPassword: "pass",
+      b2AccountId: "id",
+      b2AccountKey: "key",
+    });
+
+    await assertRejects(
+      () => model.methods.check.execute({}, context),
+      Error,
+      "did not match expected shape",
+    );
+    assertEquals(writes.length, 0, "Must NOT write a checkResult on exit-0 shape mismatch");
+  } finally {
+    await Deno.remove(tmpDir, { recursive: true });
+  }
+});
+
+Deno.test("ISSUE-3/CORR-1: check — exit 0 with schema-mismatched summary fails at boundary before writeResource", async () => {
+  const tmpDir = await Deno.makeTempDir({ prefix: "swamp-i3-check-badsummary-" });
+  try {
+    // exit 0, a summary line but missing the required num_errors field.
+    const fakeBinary = await makeCheckBinary(
+      tmpDir,
+      `{"message_type":"summary","suggest_prune":false}`,
+      0,
+    );
+    const { context, writes } = makeContext({
+      repository: `${tmpDir}/repo`,
+      repoDir: tmpDir,
+      resticPath: fakeBinary,
+      resticPassword: "pass",
+      b2AccountId: "id",
+      b2AccountKey: "key",
+    });
+
+    await assertRejects(
+      () => model.methods.check.execute({}, context),
+      Error,
+      "did not match expected shape",
+    );
+    assertEquals(writes.length, 0, "Must NOT write a checkResult on exit-0 schema mismatch");
+  } finally {
+    await Deno.remove(tmpDir, { recursive: true });
+  }
+});
+
 // ---------------------------------------------------------------------------
 // S5: snapshots non-array payload fails at the boundary
 // ---------------------------------------------------------------------------

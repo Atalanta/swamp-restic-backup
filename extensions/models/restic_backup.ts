@@ -501,11 +501,11 @@ export const model = {
           username: snap.username ?? "",
         }));
 
-        // Select latest by ordinal time comparison (ISO strings compare correctly
-        // with < / > — NOT localeCompare, which is locale-sensitive).
-        const sortedByTime = [...snapshots].sort((a, b) =>
-          new Date(a.time) < new Date(b.time) ? -1 : new Date(a.time) > new Date(b.time) ? 1 : 0
-        );
+        // Select latest by chronological time comparison — parse each timestamp
+        // to epoch millis once, then compare ordinally (NOT localeCompare, which
+        // is locale-sensitive). Date.parse handles restic's RFC3339 timestamps.
+        const timeMs = (iso: string): number => Date.parse(iso);
+        const sortedByTime = [...snapshots].sort((a, b) => timeMs(a.time) - timeMs(b.time));
         const latest = sortedByTime[sortedByTime.length - 1];
 
         const snapshotsData = {
@@ -577,13 +577,17 @@ export const model = {
         //      A bad JSONL line (unparseable) is a boundary failure.
         //   2. If a summary line is found, validate it against the check schema.
         //      A schema-mismatched summary is a boundary failure.
-        //   3. If no summary line is found (null), fall through to ok:false.
+        //   3. If no valid summary is found, the exit code decides:
+        //      - exit 0  → restic claims success but produced no parseable check
+        //        result: that is exactly the silent-default this ticket removes,
+        //        so it is a BOUNDARY FAILURE (fail before writeResource).
+        //      - non-zero → restic already failed the integrity check (e.g. it
+        //        emitted exit_error JSON, not a summary); a missing summary is the
+        //        expected failed state, recorded as ok:false — NOT a shape mismatch.
         let checkSummary: { message_type: "summary"; num_errors: number } | null;
-        if (result.stdout.trim() === "") {
-          checkSummary = null;
-        } else {
+        let rawSummary: Record<string, unknown> | null = null;
+        if (result.stdout.trim() !== "") {
           // Use findJsonlMessage to locate the summary line; sanitized error on bad JSONL.
-          let rawSummary: Record<string, unknown> | null;
           try {
             rawSummary = findJsonlMessage(result.stdout, "summary");
           } catch {
@@ -592,20 +596,27 @@ export const model = {
               "restic check: output did not match expected shape — invalid JSON",
             );
           }
-          if (rawSummary !== null) {
-            // A summary line exists — validate it against the schema.
-            const validation = ResticCheckSummarySchema.safeParse(rawSummary);
-            if (!validation.success) {
-              throw new Error(
-                "restic check: output did not match expected shape",
-              );
-            }
-            checkSummary = validation.data;
-          } else {
-            // No summary line found (e.g. restic emitted exit_error JSON) — not a
-            // shape mismatch; treat as absence of summary data (ok:false, no num_errors).
-            checkSummary = null;
+        }
+
+        if (rawSummary !== null) {
+          // A summary line exists — validate it against the schema.
+          const validation = ResticCheckSummarySchema.safeParse(rawSummary);
+          if (!validation.success) {
+            throw new Error(
+              "restic check: output did not match expected shape",
+            );
           }
+          checkSummary = validation.data;
+        } else if (result.success) {
+          // exit 0 but no valid check summary — restic reported success without a
+          // parseable result. Fail at the boundary rather than defaulting to ok:true.
+          throw new Error(
+            "restic check: exit 0 but no valid check summary — output did not match expected shape",
+          );
+        } else {
+          // Non-zero exit with no summary: the check itself failed. Recorded as
+          // ok:false below; not a boundary failure.
+          checkSummary = null;
         }
 
         const numErrors = checkSummary?.num_errors ?? 0;
