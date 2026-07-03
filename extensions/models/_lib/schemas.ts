@@ -10,7 +10,7 @@
  * Does NOT include:
  *   - ResticResult (owned by invoker.ts — not schema-derived)
  *   - ResolvedSecrets (owned by secrets.ts — not schema-derived)
- *   - MethodContext (owned by restic_backup.ts — runtime-injected port)
+ *   - MethodContext (owned by _lib/method-context.ts — runtime-injected port)
  *
  * SPDX-License-Identifier: Apache-2.0
  *
