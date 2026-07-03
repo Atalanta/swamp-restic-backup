@@ -8,7 +8,7 @@
 
 import { z } from "npm:zod@4.4.3";
 import { PruneArgsSchema } from "../schemas.ts";
-import { invokeRestic } from "../invoker.ts";
+import { invokeResticPrune } from "../invoker.ts";
 import { runSecretPreflight } from "../preflight.ts";
 import { redactSecrets } from "../secrets.ts";
 import type { MethodContext } from "../method-context.ts";
@@ -26,11 +26,7 @@ export const prune = {
     );
 
     const startTime = performance.now();
-    const result = await invokeRestic(
-      [resticPath, "prune", "--json", "--repo", repository],
-      secrets,
-      cwd,
-    );
+    const result = await invokeResticPrune(repository, secrets, resticPath, cwd);
     const durationMs = Math.round(performance.now() - startTime);
 
     if (!result.success) {

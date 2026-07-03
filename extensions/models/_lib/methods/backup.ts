@@ -8,7 +8,7 @@
 
 import { z } from "npm:zod@4.4.3";
 import { BackupArgsSchema, ResticBackupSummarySchema } from "../schemas.ts";
-import { invokeRestic, decodeResticSummary } from "../invoker.ts";
+import { invokeResticBackup, decodeResticSummary } from "../invoker.ts";
 import { runSecretPreflight } from "../preflight.ts";
 import { buildIncludeExcludeLists } from "../policy.ts";
 import { redactSecrets } from "../secrets.ts";
@@ -30,23 +30,21 @@ export const backup = {
       context.globalArgs,
     );
 
-    // Build argv array — NEVER a shell string to prevent injection
-    const argv: string[] = [resticPath, "backup", "--json", "--repo", repository];
-    for (const pattern of excludePatterns) {
-      argv.push("--exclude", pattern);
-    }
     const allTags = [
       ...(context.globalArgs.hostTag ? [context.globalArgs.hostTag] : []),
       ...context.globalArgs.extraTags,
       ...args.tags,
     ];
-    for (const tag of allTags) {
-      argv.push("--tag", tag);
-    }
-    // Include paths come last as positional args
-    argv.push(...includePaths);
 
-    const result = await invokeRestic(argv, secrets, cwd);
+    // Pass typed inputs to the invoker; it assembles argv internally.
+    // Exclude-then-tag-then-positional-paths order is enforced inside invokeResticBackup.
+    const result = await invokeResticBackup(
+      { excludePatterns, tags: allTags, includePaths },
+      repository,
+      secrets,
+      resticPath,
+      cwd,
+    );
 
     if (!result.success) {
       // Redact secrets from any subprocess-derived text before including in the error.

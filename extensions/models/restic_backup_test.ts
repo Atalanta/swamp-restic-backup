@@ -24,6 +24,7 @@ import {
   DEFAULT_INCLUDE_PATHS,
 } from "./_lib/policy.ts";
 import {
+  assertSafeRestoreTarget,
   checkRestoreTargetSafety,
   isNonPosixAbsolute,
   resolveRestoreTarget,
@@ -32,9 +33,18 @@ import {
   decodeResticOutput,
   decodeResticSummary,
   findJsonlMessage,
-  invokeRestic,
+  invokeResticBackup,
+  invokeResticCatConfig,
+  invokeResticCheck,
+  invokeResticForget,
+  invokeResticInit,
+  invokeResticPrune,
+  invokeResticRestore,
+  invokeResticSnapshots,
   parseResticJsonOutput,
 } from "./_lib/invoker.ts";
+// ISSUE-11/S7: import the invoker module as a namespace to assert its exported surface.
+import * as invokerNs from "./_lib/invoker.ts";
 import { runSecretPreflight } from "./_lib/preflight.ts";
 import { redactSecrets, resolveSecrets } from "./_lib/secrets.ts";
 import {
@@ -3507,58 +3517,411 @@ Deno.test("ISSUE-5/S6: restore into .swamp/ with confirm:true proceeds and recor
   }
 });
 
-// ARCH-1: invokeRestic must refuse the 'restore' command so the only structural
-// path to a restore subprocess is invokeResticRestore (which requires a
-// SafeRestoreTarget). This closes the loophole where a future caller passes a
-// raw --target through the generic invoker.
-Deno.test("ISSUE-5/ARCH-1: invokeRestic refuses a 'restore' argv (subcommand-first and after global options)", async () => {
-  const globalArgs = makeGlobalArgs({ resticPassword: "pw", b2AccountId: "id", b2AccountKey: "key" });
-  const secrets = resolveSecrets(globalArgs as GlobalArgs);
-  // (a) restore as the immediate subcommand.
-  const err = await assertRejects(
-    () =>
-      invokeRestic(
-        ["/opt/homebrew/bin/restic", "restore", "latest", "--json", "--repo", "b2:x:y", "--target", "/tmp/whatever"],
-        secrets,
-        "/tmp",
-      ),
-    Error,
+// =============================================================================
+// ISSUE-11/S1: Typed per-command invoker argv-shape unit tests
+//
+// Each test asserts the typed entry builds the EXACT argv (binary, subcommand,
+// --json, --repo, flags in the same order, positionals last) that the method
+// module would have assembled by hand before the refactor. This locks in the
+// flag order so a silent drift is caught here, not only by observable-result
+// integration tests.
+// =============================================================================
+
+Deno.test("ISSUE-11/S1: invokeResticCheck builds argv: [binary, check, --json, --repo, repo]", async () => {
+  // invokeResticCheck must call restic with exactly [binary, "check", "--json", "--repo", repository].
+  // We use a fake binary that dumps argv to a file and exits 0.
+  const tmpDir = await Deno.makeTempDir({ prefix: "swamp-i11-check-" });
+  const argvDumpFile = `${tmpDir}/argv-dump`;
+  const fakeBinary = `${tmpDir}/fake-restic`;
+  await Deno.writeTextFile(
+    fakeBinary,
+    `#!/bin/sh\nprintf '%s\\n' "$@" > "${argvDumpFile}"\necho '{"message_type":"summary","num_errors":0}'\nexit 0\n`,
   );
-  assertStringIncludes(err.message, "invokeRestic must not run 'restore'");
-  assertStringIncludes(err.message, "invokeResticRestore");
-  // (b) ARCH-3: a global flag BEFORE the subcommand violates the argv[1]-is-
-  // subcommand contract and is refused — so `-r repo restore` / `--repo X restore`
-  // cannot slip a restore past the guard.
-  const err2 = await assertRejects(
-    () =>
-      invokeRestic(
-        ["/opt/homebrew/bin/restic", "--repo", "b2:x:y", "restore", "latest", "--target", "/tmp/whatever"],
-        secrets,
-        "/tmp",
-      ),
-    Error,
+  await Deno.chmod(fakeBinary, 0o755);
+  try {
+    const globalArgs = makeGlobalArgs({ resticPassword: "pw", b2AccountId: "id", b2AccountKey: "key" });
+    const secrets = resolveSecrets(globalArgs as GlobalArgs);
+    await invokeResticCheck("b2:bucket:path", secrets, fakeBinary, tmpDir);
+    const dumpLines = (await Deno.readTextFile(argvDumpFile)).trim().split("\n");
+    assertEquals(dumpLines, ["check", "--json", "--repo", "b2:bucket:path"]);
+  } finally {
+    await Deno.remove(tmpDir, { recursive: true });
+  }
+});
+
+Deno.test("ISSUE-11/S1: invokeResticPrune builds argv: [binary, prune, --json, --repo, repo]", async () => {
+  const tmpDir = await Deno.makeTempDir({ prefix: "swamp-i11-prune-" });
+  const argvDumpFile = `${tmpDir}/argv-dump`;
+  const fakeBinary = `${tmpDir}/fake-restic`;
+  await Deno.writeTextFile(
+    fakeBinary,
+    `#!/bin/sh\nprintf '%s\\n' "$@" > "${argvDumpFile}"\nexit 0\n`,
   );
-  assertStringIncludes(err2.message, "expects the subcommand at argv[1]");
-  const err3 = await assertRejects(
-    () =>
-      invokeRestic(
-        ["/opt/homebrew/bin/restic", "-r", "b2:x:y", "restore", "latest", "--target", "/tmp/whatever"],
-        secrets,
-        "/tmp",
-      ),
-    Error,
+  await Deno.chmod(fakeBinary, 0o755);
+  try {
+    const globalArgs = makeGlobalArgs({ resticPassword: "pw", b2AccountId: "id", b2AccountKey: "key" });
+    const secrets = resolveSecrets(globalArgs as GlobalArgs);
+    await invokeResticPrune("b2:bucket:path", secrets, fakeBinary, tmpDir);
+    const dumpLines = (await Deno.readTextFile(argvDumpFile)).trim().split("\n");
+    assertEquals(dumpLines, ["prune", "--json", "--repo", "b2:bucket:path"]);
+  } finally {
+    await Deno.remove(tmpDir, { recursive: true });
+  }
+});
+
+Deno.test("ISSUE-11/S1: invokeResticSnapshots builds argv with --host, --tag per tag, --path in order", async () => {
+  const tmpDir = await Deno.makeTempDir({ prefix: "swamp-i11-snapshots-" });
+  const argvDumpFile = `${tmpDir}/argv-dump`;
+  const fakeBinary = `${tmpDir}/fake-restic`;
+  await Deno.writeTextFile(
+    fakeBinary,
+    `#!/bin/sh\nprintf '%s\\n' "$@" > "${argvDumpFile}"\necho '[]'\nexit 0\n`,
   );
-  assertStringIncludes(err3.message, "expects the subcommand at argv[1]");
-  // (c) FALSE-POSITIVE guard: a backup whose --tag value is literally "restore"
-  // is NOT a restore command and must NOT be refused (it fails later at spawn on
-  // the fake path, but not with the restore-refusal message).
-  const backupWithRestoreTag = invokeRestic(
-    ["/nonexistent/restic", "backup", "--tag", "restore", "/tmp/src"],
-    secrets,
-    "/tmp",
+  await Deno.chmod(fakeBinary, 0o755);
+  try {
+    const globalArgs = makeGlobalArgs({ resticPassword: "pw", b2AccountId: "id", b2AccountKey: "key" });
+    const secrets = resolveSecrets(globalArgs as GlobalArgs);
+
+    // With all optional fields
+    await invokeResticSnapshots(
+      { host: "myhostname", tags: ["tagA", "tagB"], path: "/some/path" },
+      "b2:bucket:path",
+      secrets,
+      fakeBinary,
+      tmpDir,
+    );
+    const dumpLinesAll = (await Deno.readTextFile(argvDumpFile)).trim().split("\n");
+    assertEquals(dumpLinesAll, [
+      "snapshots", "--json", "--repo", "b2:bucket:path",
+      "--host", "myhostname",
+      "--tag", "tagA",
+      "--tag", "tagB",
+      "--path", "/some/path",
+    ]);
+
+    // Without optional fields (no host, no tags, no path) — minimal form
+    await invokeResticSnapshots(
+      { tags: [] },
+      "b2:bucket:path",
+      secrets,
+      fakeBinary,
+      tmpDir,
+    );
+    const dumpLinesMin = (await Deno.readTextFile(argvDumpFile)).trim().split("\n");
+    assertEquals(dumpLinesMin, ["snapshots", "--json", "--repo", "b2:bucket:path"]);
+  } finally {
+    await Deno.remove(tmpDir, { recursive: true });
+  }
+});
+
+Deno.test("ISSUE-11/S1: invokeResticForget builds argv with keep-* flags then --dry-run then --host", async () => {
+  const tmpDir = await Deno.makeTempDir({ prefix: "swamp-i11-forget-" });
+  const argvDumpFile = `${tmpDir}/argv-dump`;
+  const fakeBinary = `${tmpDir}/fake-restic`;
+  await Deno.writeTextFile(
+    fakeBinary,
+    `#!/bin/sh\nprintf '%s\\n' "$@" > "${argvDumpFile}"\necho '[]'\nexit 0\n`,
   );
-  const backupResult = await backupWithRestoreTag;
-  // spawnRestic returns a structured failure (exit 127) for a missing binary
-  // rather than throwing — the point is it was NOT rejected as a restore.
-  assertEquals(backupResult.success, false);
+  await Deno.chmod(fakeBinary, 0o755);
+  try {
+    const globalArgs = makeGlobalArgs({ resticPassword: "pw", b2AccountId: "id", b2AccountKey: "key" });
+    const secrets = resolveSecrets(globalArgs as GlobalArgs);
+
+    // Full set: all keep-* flags + dry-run + host
+    await invokeResticForget(
+      { keepLast: 7, keepDaily: 14, keepWeekly: 8, keepMonthly: 12, dryRun: true, host: "myhost" },
+      "b2:bucket:path",
+      secrets,
+      fakeBinary,
+      tmpDir,
+    );
+    const dumpAll = (await Deno.readTextFile(argvDumpFile)).trim().split("\n");
+    assertEquals(dumpAll, [
+      "forget", "--json", "--repo", "b2:bucket:path",
+      "--keep-last", "7",
+      "--keep-daily", "14",
+      "--keep-weekly", "8",
+      "--keep-monthly", "12",
+      "--dry-run",
+      "--host", "myhost",
+    ]);
+
+    // Minimal: no optional fields set, dryRun=false
+    await invokeResticForget(
+      { dryRun: false },
+      "b2:bucket:path",
+      secrets,
+      fakeBinary,
+      tmpDir,
+    );
+    const dumpMin = (await Deno.readTextFile(argvDumpFile)).trim().split("\n");
+    assertEquals(dumpMin, ["forget", "--json", "--repo", "b2:bucket:path"]);
+  } finally {
+    await Deno.remove(tmpDir, { recursive: true });
+  }
+});
+
+Deno.test("ISSUE-11/S1: invokeResticBackup builds argv: --exclude* then --tag* then positional paths", async () => {
+  const tmpDir = await Deno.makeTempDir({ prefix: "swamp-i11-backup-" });
+  const argvDumpFile = `${tmpDir}/argv-dump`;
+  const fakeBinary = `${tmpDir}/fake-restic`;
+  await Deno.writeTextFile(
+    fakeBinary,
+    `#!/bin/sh\nprintf '%s\\n' "$@" > "${argvDumpFile}"\necho '{"message_type":"summary","snapshot_id":"abc","files_new":0,"files_changed":0,"files_unmodified":0,"dirs_new":0,"dirs_changed":0,"dirs_unmodified":0,"data_added":0,"data_added_packed":0,"total_files_processed":0,"total_bytes_processed":0,"total_duration":0.1,"backup_start":"2026-07-03T00:00:00Z","backup_end":"2026-07-03T00:00:01Z"}'\nexit 0\n`,
+  );
+  await Deno.chmod(fakeBinary, 0o755);
+  try {
+    const globalArgs = makeGlobalArgs({ resticPassword: "pw", b2AccountId: "id", b2AccountKey: "key" });
+    const secrets = resolveSecrets(globalArgs as GlobalArgs);
+
+    // Full: two excludes, two tags, two include paths
+    await invokeResticBackup(
+      {
+        excludePatterns: [".swamp/bundles", ".swamp/logs"],
+        tags: ["host-tag", "extra-tag"],
+        includePaths: [".swamp/data", ".swamp/outputs"],
+      },
+      "b2:bucket:path",
+      secrets,
+      fakeBinary,
+      tmpDir,
+    );
+    const dumpLines = (await Deno.readTextFile(argvDumpFile)).trim().split("\n");
+    assertEquals(dumpLines, [
+      "backup", "--json", "--repo", "b2:bucket:path",
+      "--exclude", ".swamp/bundles",
+      "--exclude", ".swamp/logs",
+      "--tag", "host-tag",
+      "--tag", "extra-tag",
+      ".swamp/data",
+      ".swamp/outputs",
+    ]);
+  } finally {
+    await Deno.remove(tmpDir, { recursive: true });
+  }
+});
+
+Deno.test("ISSUE-11/S1: invokeResticInit builds argv: [binary, init, --json, --repo, repo]", async () => {
+  const tmpDir = await Deno.makeTempDir({ prefix: "swamp-i11-init-" });
+  const argvDumpFile = `${tmpDir}/argv-dump`;
+  const fakeBinary = `${tmpDir}/fake-restic`;
+  await Deno.writeTextFile(
+    fakeBinary,
+    `#!/bin/sh\nprintf '%s\\n' "$@" > "${argvDumpFile}"\necho '{"message_type":"initialized","id":"abc123","repository":"test"}'\nexit 0\n`,
+  );
+  await Deno.chmod(fakeBinary, 0o755);
+  try {
+    const globalArgs = makeGlobalArgs({ resticPassword: "pw", b2AccountId: "id", b2AccountKey: "key" });
+    const secrets = resolveSecrets(globalArgs as GlobalArgs);
+    await invokeResticInit("b2:bucket:path", secrets, fakeBinary, tmpDir);
+    const dumpLines = (await Deno.readTextFile(argvDumpFile)).trim().split("\n");
+    assertEquals(dumpLines, ["init", "--json", "--repo", "b2:bucket:path"]);
+  } finally {
+    await Deno.remove(tmpDir, { recursive: true });
+  }
+});
+
+Deno.test("ISSUE-11/S1: invokeResticCatConfig builds argv: [binary, cat, config, --json, --repo, repo]", async () => {
+  const tmpDir = await Deno.makeTempDir({ prefix: "swamp-i11-catconfig-" });
+  const argvDumpFile = `${tmpDir}/argv-dump`;
+  const fakeBinary = `${tmpDir}/fake-restic`;
+  await Deno.writeTextFile(
+    fakeBinary,
+    `#!/bin/sh\nprintf '%s\\n' "$@" > "${argvDumpFile}"\necho '{}'\nexit 0\n`,
+  );
+  await Deno.chmod(fakeBinary, 0o755);
+  try {
+    const globalArgs = makeGlobalArgs({ resticPassword: "pw", b2AccountId: "id", b2AccountKey: "key" });
+    const secrets = resolveSecrets(globalArgs as GlobalArgs);
+    await invokeResticCatConfig("b2:bucket:path", secrets, fakeBinary, tmpDir);
+    const dumpLines = (await Deno.readTextFile(argvDumpFile)).trim().split("\n");
+    assertEquals(dumpLines, ["cat", "config", "--json", "--repo", "b2:bucket:path"]);
+  } finally {
+    await Deno.remove(tmpDir, { recursive: true });
+  }
+});
+
+// ARCH-1 (RETARGETED for ISSUE-11): The restore-safety gate is now STRUCTURAL —
+// enforced by the type surface, not a runtime argv[1] check. Concrete assertions:
+//   (a) _lib/invoker.ts exports NO generic secret-injecting entry taking argv: string[]
+//       (no exported invokeRestic(argv, secrets, cwd) or equivalent)
+//   (b) Each of the six rewired method modules does NOT import invokeRestic or
+//       invokeResticInternal and builds no raw restic argv for execution
+//   (c) restore.ts reaches restic only via invokeResticRestore
+//
+// These assertions fail if any raw secret-injecting argv path is reintroduced,
+// preserving the safety intent of the original ISSUE-5/ARCH-1 test.
+Deno.test("ISSUE-5/ARCH-1 (RETARGETED ISSUE-11): invoker exports no generic argv:string[] secret-injecting entry; method modules build no raw argv", async () => {
+  // (a) The invoker module namespace must NOT contain an exported function that
+  // matches the signature of the retired invokeRestic(argv: string[], secrets, cwd).
+  // We check by name: "invokeRestic" and "invokeResticInternal" must not be present
+  // in the module's exported surface.
+  const exportedNames = Object.keys(invokerNs);
+  assertEquals(
+    exportedNames.includes("invokeRestic"),
+    false,
+    "invoker must NOT export a generic 'invokeRestic' entry — the type surface is the restore gate (ISSUE-11/ARCH-1)",
+  );
+  assertEquals(
+    exportedNames.includes("invokeResticInternal"),
+    false,
+    "invoker must NOT export 'invokeResticInternal' — it must remain module-private (ISSUE-11/ARCH-1)",
+  );
+
+  // (a2) Stronger than a name check (CORR-2): the invoker SOURCE must not EXPORT
+  // any secret-injecting function that takes a raw `argv: string[]` — regardless
+  // of its name. Scan every exported function signature; a param list containing
+  // `argv: string[]` alongside a ResolvedSecrets param is the retired shape.
+  // invokeResticNoSecrets is the only argv:string[] entry allowed (it injects NO
+  // secrets — it is the no-repo version probe).
+  const invokerSource = await Deno.readTextFile(
+    new URL("./_lib/invoker.ts", import.meta.url).pathname,
+  );
+  const exportedFnSignatures = invokerSource.match(
+    /export\s+(?:async\s+)?function\s+(\w+)\s*\(([^)]*)\)/gs,
+  ) ?? [];
+  for (const sig of exportedFnSignatures) {
+    const nameMatch = sig.match(/function\s+(\w+)/);
+    const name = nameMatch ? nameMatch[1] : "?";
+    if (name === "invokeResticNoSecrets") continue; // no-secret probe: allowed
+    const takesRawArgv = /\bargv\s*:\s*string\s*\[\s*\]/.test(sig);
+    const takesSecrets = /ResolvedSecrets/.test(sig);
+    assertEquals(
+      takesRawArgv && takesSecrets,
+      false,
+      `invoker exports '${name}' taking a raw argv:string[] + ResolvedSecrets — no secret-injecting generic argv entry is allowed (ISSUE-11/ARCH-1/CORR-2)`,
+    );
+  }
+
+  // (b) Each rewired method module's SOURCE must NOT import invokeRestic or
+  // invokeResticInternal and must NOT construct a raw argv for execution.
+  // We read each method file as text and assert the absence of these patterns.
+  const rewiringMethods = [
+    "check.ts",
+    "prune.ts",
+    "snapshots.ts",
+    "forget.ts",
+    "backup.ts",
+    "init.ts",
+  ];
+
+  for (const methodFile of rewiringMethods) {
+    const source = await Deno.readTextFile(
+      new URL(`./_lib/methods/${methodFile}`, import.meta.url).pathname,
+    );
+
+    // Must not import the retired generic invoker.
+    // We look for the exact token "invokeRestic" NOT followed by uppercase letters
+    // (which would indicate one of the typed entries: invokeResticCheck, invokeResticPrune, etc.).
+    // Regex: word "invokeRestic" followed by a non-uppercase or end-of-string.
+    const hasGenericInvokeRestic = /\binvokeRestic\b(?![A-Z])/.test(source);
+    assertEquals(
+      hasGenericInvokeRestic,
+      false,
+      `${methodFile}: must NOT import the generic 'invokeRestic' (ISSUE-11/ARCH-1)`,
+    );
+    assertEquals(
+      source.includes("invokeResticInternal"),
+      false,
+      `${methodFile}: must NOT import or call 'invokeResticInternal' — that is module-private (ISSUE-11/ARCH-1)`,
+    );
+
+    // Must not build a raw argv array for restic execution — the tell-tale sign
+    // is constructing `[resticPath, "subcommand", ...` for an invoke call.
+    // We check for the old pattern: an array literal starting with resticPath
+    // that is then passed to a secret-injecting invoker.
+    const hasRawArgvInvoke = /\[\s*resticPath\s*,\s*["'][a-z]/.test(source);
+    assertEquals(
+      hasRawArgvInvoke,
+      false,
+      `${methodFile}: must NOT build a raw argv array for restic execution (ISSUE-11/ARCH-1); use a typed invoker entry`,
+    );
+  }
+
+  // (c) restore.ts must import invokeResticRestore (not invokeRestic or raw spawn).
+  const restoreSource = await Deno.readTextFile(
+    new URL("./_lib/methods/restore.ts", import.meta.url).pathname,
+  );
+  assertEquals(
+    restoreSource.includes("invokeResticRestore"),
+    true,
+    "restore.ts must reach restic via invokeResticRestore (ISSUE-11/ARCH-1)",
+  );
+  // CORR-2: not just imported — restore.ts must actually CALL invokeResticRestore(
+  // (an import without a call would pass the includes() check but not run it).
+  assertEquals(
+    /invokeResticRestore\s*\(/.test(restoreSource),
+    true,
+    "restore.ts must CALL invokeResticRestore(...) in execute, not merely import it (ISSUE-11/ARCH-1/CORR-2)",
+  );
+  // And it must not cast to SafeRestoreTarget to fabricate a target.
+  assertEquals(
+    /as\s+SafeRestoreTarget/.test(restoreSource),
+    false,
+    "restore.ts must NOT cast to SafeRestoreTarget — the value comes from resolveRestoreTarget (ISSUE-11/ARCH-1/CORR-2)",
+  );
+  const restoreHasGenericInvokeRestic = /\binvokeRestic\b(?![A-Z])/.test(restoreSource);
+  assertEquals(
+    restoreHasGenericInvokeRestic,
+    false,
+    "restore.ts must NOT import the retired generic invokeRestic (ISSUE-11/ARCH-1)",
+  );
+  assertEquals(
+    restoreSource.includes("invokeResticInternal"),
+    false,
+    "restore.ts must NOT call invokeResticInternal directly (ISSUE-11/ARCH-1)",
+  );
+});
+
+// ===========================================================================
+// ISSUE-11/CORR-1: runtime brand enforcement at the restore boundary.
+// The SafeRestoreTarget type is erased at runtime; assertSafeRestoreTarget +
+// the check inside invokeResticRestore refuse a forged/cast target so the #5
+// guarantee holds even against a JS caller or `as SafeRestoreTarget` cast.
+// ===========================================================================
+
+Deno.test("ISSUE-11/CORR-1: assertSafeRestoreTarget accepts a resolveRestoreTarget result and refuses a forged object", async () => {
+  const { repoDir } = await makeRestoreTestDir();
+  const stagingDir = await Deno.makeTempDir({ prefix: "swamp-i11-brand-" });
+  try {
+    // Genuine branded value passes.
+    const real = await resolveRestoreTarget(stagingDir, repoDir, false);
+    assertSafeRestoreTarget(real); // must not throw
+
+    // Forged plain object (no runtime brand symbol) is refused.
+    const forged = { path: `${repoDir}/.swamp`, overridden: false } as unknown as Parameters<typeof assertSafeRestoreTarget>[0];
+    let threw = false;
+    try {
+      assertSafeRestoreTarget(forged);
+    } catch (err) {
+      threw = true;
+      assertStringIncludes((err as Error).message, "not produced by resolveRestoreTarget");
+    }
+    assertEquals(threw, true, "assertSafeRestoreTarget must refuse a forged target");
+  } finally {
+    await Deno.remove(repoDir, { recursive: true });
+    await Deno.remove(stagingDir, { recursive: true });
+  }
+});
+
+Deno.test("ISSUE-11/CORR-1: invokeResticRestore refuses a forged (non-branded) target before spawning restic", async () => {
+  const secrets = resolveSecrets(
+    makeGlobalArgs({ resticPassword: "pw", b2AccountId: "id", b2AccountKey: "key" }) as GlobalArgs,
+  );
+  // A forged target with a dangerous path — invokeResticRestore must refuse it
+  // before building argv / spawning (resticPath is nonexistent to prove no spawn).
+  const forged = { path: "/etc", overridden: false } as unknown as Parameters<typeof invokeResticRestore>[0];
+  // invokeResticRestore runs the brand check before its first await, so the
+  // refusal surfaces as a synchronous throw (not a rejected promise) — the point
+  // is it happens BEFORE any spawn. Capture either shape.
+  let message = "";
+  let refused = false;
+  try {
+    await invokeResticRestore(forged, "latest", "b2:x:y", secrets, "/nonexistent/restic", "/tmp");
+  } catch (err) {
+    refused = true;
+    message = (err as Error).message;
+  }
+  assertEquals(refused, true, "invokeResticRestore must refuse a forged target");
+  assertStringIncludes(message, "not produced by resolveRestoreTarget");
 });

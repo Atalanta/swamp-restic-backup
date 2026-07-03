@@ -8,7 +8,7 @@
 
 import { z } from "npm:zod@4.4.3";
 import { InitArgsSchema, ResticInitOutputSchema } from "../schemas.ts";
-import { invokeRestic, decodeResticOutput } from "../invoker.ts";
+import { invokeResticCatConfig, invokeResticInit, decodeResticOutput } from "../invoker.ts";
 import { runSecretPreflight } from "../preflight.ts";
 import { redactSecrets } from "../secrets.ts";
 import type { MethodContext } from "../method-context.ts";
@@ -33,11 +33,7 @@ export const init = {
     // not exist OR cannot be opened (bad creds, corrupt repo, backend error).
     // We only treat exit 0 as "already initialized"; everything else proceeds
     // to `restic init` and lets restic itself report any real failure.
-    const catConfigResult = await invokeRestic(
-      [resticPath, "cat", "config", "--json", "--repo", repository],
-      secrets,
-      cwd,
-    );
+    const catConfigResult = await invokeResticCatConfig(repository, secrets, resticPath, cwd);
 
     if (catConfigResult.success) {
       // Repository already exists and is openable — report initialized, not created.
@@ -60,11 +56,7 @@ export const init = {
     }
 
     // Repository is not yet openable — attempt to create it.
-    const result = await invokeRestic(
-      [resticPath, "init", "--json", "--repo", repository],
-      secrets,
-      cwd,
-    );
+    const result = await invokeResticInit(repository, secrets, resticPath, cwd);
 
     let initialized = false;
     let created = false;

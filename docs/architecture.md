@@ -57,11 +57,11 @@ import graph.
 C4Component
     Container_Boundary(model, "Model definition") {
         Component(entry, "Entry (restic_backup.ts)", "module", "Thin registration shell: imports, public re-export block (four helpers/constants), model metadata, resources map, and model.methods wiring the eight method imports. No execute bodies.")
-        Component(methodmodules, "_lib/methods/* (8 modules)", "module", "One focused module per method: check-restic.ts, init.ts, backup.ts, snapshots.ts, check.ts, restore.ts, forget.ts, prune.ts. Each exports { description, arguments, execute } and imports only the _lib concern modules it needs.")
+        Component(methodmodules, "_lib/methods/* (8 modules)", "module", "One focused module per method: check-restic.ts, init.ts, backup.ts, snapshots.ts, check.ts, restore.ts, forget.ts, prune.ts. Each exports { description, arguments, execute } and imports only the _lib concern modules it needs. The six rewired methods pass typed inputs to per-command invoker entries; restore uses invokeResticRestore(SafeRestoreTarget).")
         Component(methodcontext, "_lib/method-context.ts", "module", "MethodContext type — the runtime port injected by swamp into every method execute. Internal _lib type; not re-exported.")
         Component(preflight, "_lib/preflight.ts", "module", "runSecretPreflight — sole definition of the secret-bearing prologue (resolveSecrets → ResolvedSecrets, read args, probe --json) shared by the seven operational methods; composes secrets + invoker")
         Component(secrets, "_lib/secrets.ts", "module", "resolveSecrets (sole producer of the branded, unforgeable ResolvedSecrets), redactSecrets — a secret cannot reach restic without passing validation")
-        Component(invoker, "_lib/invoker.ts", "module", "invokeRestic, invokeResticNoSecrets, probeResticCapability, parse helpers, ResticResult — sole owner of Deno.Command (spawnRestic is module-private)")
+        Component(invoker, "_lib/invoker.ts", "module", "Typed per-command invokers (invokeResticCheck, invokeResticPrune, invokeResticSnapshots, invokeResticForget, invokeResticBackup, invokeResticInit, invokeResticCatConfig) plus invokeResticRestore(SafeRestoreTarget), invokeResticNoSecrets, probeResticCapability, parse helpers, ResticResult. Sole owner of Deno.Command (spawnRestic is module-private). No generic argv:string[] export — method modules pass typed inputs.")
         Component(pathsafety, "_lib/path-safety.ts", "module", "normalizePosixPath, resolvePathWithAncestor, checkRestoreTargetSafety, resolveRestoreTarget — sole producer of the branded SafeRestoreTarget (POSIX-only); the restic restore call accepts only that value")
         Component(policy, "_lib/policy.ts", "module", "DEFAULT_INCLUDE_PATHS, DEFAULT_EXCLUDE_PATTERNS, buildIncludeExcludeLists — sole source of the backup policy")
         Component(schemas, "_lib/schemas.ts", "module", "arg + result Zod schemas and their inferred types")
@@ -71,7 +71,7 @@ C4Component
     Rel(methodmodules, methodcontext, "imports MethodContext type")
     Rel(methodmodules, preflight, "imports")
     Rel(methodmodules, secrets, "imports (redactSecrets)")
-    Rel(methodmodules, invoker, "imports")
+    Rel(methodmodules, invoker, "passes typed inputs to per-command entries")
     Rel(methodmodules, pathsafety, "imports")
     Rel(invoker, pathsafety, "imports SafeRestoreTarget (type)")
     Rel(methodmodules, policy, "imports")
@@ -83,14 +83,18 @@ C4Component
 The seven operational methods (`init`, `backup`, `snapshots`, `check`,
 `restore`, `forget`, `prune`) obtain their secrets and repo inputs from
 `runSecretPreflight`; `checkRestic` runs its `--json` probe without secrets and
-does not use the pre-flight.
+does not use the pre-flight. The six rewired methods (`init`, `backup`,
+`snapshots`, `check`, `forget`, `prune`) pass typed inputs to per-command
+invoker entries; `restore` uses `invokeResticRestore(SafeRestoreTarget)`.
+No method module builds a raw argv array or imports a generic secret-injecting
+invoker — the invoker's type surface is the enforcement boundary.
 
 ## Trust boundaries and invariants
 
 - Secrets (restic password + two B2 credentials) enter only as `vault.get`
   references resolved by swamp; the Secret layer keeps resolved values out of
   argv, result resources, logs, and the backup.
-- The restic invoker builds an argv array (no shell), always passing `--json`.
+- The restic invoker exposes typed per-command entries (no generic `argv: string[]` export). Method modules pass typed inputs; the invoker assembles argv internally, always passing `--json`.
 - Restore path safety refuses targets at the repo root, `.swamp/`, an ancestor
   of `.swamp/`, or inside `.swamp/`. The guard is structural: `resolveRestoreTarget`
   produces a branded `SafeRestoreTarget` only for a safe target or an explicit

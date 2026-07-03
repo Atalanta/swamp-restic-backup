@@ -8,7 +8,7 @@
 
 import { z } from "npm:zod@4.4.3";
 import { ForgetArgsSchema, ResticForgetArraySchema } from "../schemas.ts";
-import { invokeRestic, decodeResticOutput } from "../invoker.ts";
+import { invokeResticForget, decodeResticOutput } from "../invoker.ts";
 import { runSecretPreflight } from "../preflight.ts";
 import { redactSecrets } from "../secrets.ts";
 import type { MethodContext } from "../method-context.ts";
@@ -32,15 +32,20 @@ export const forget = {
     const keepWeekly = args.keepWeekly ?? context.globalArgs.retention.keepWeekly;
     const keepMonthly = args.keepMonthly ?? context.globalArgs.retention.keepMonthly;
 
-    const argv: string[] = [resticPath, "forget", "--json", "--repo", repository];
-    if (keepLast !== undefined) argv.push("--keep-last", String(keepLast));
-    if (keepDaily !== undefined) argv.push("--keep-daily", String(keepDaily));
-    if (keepWeekly !== undefined) argv.push("--keep-weekly", String(keepWeekly));
-    if (keepMonthly !== undefined) argv.push("--keep-monthly", String(keepMonthly));
-    if (args.dryRun) argv.push("--dry-run");
-    if (args.host) argv.push("--host", args.host);
-
-    const result = await invokeRestic(argv, secrets, cwd);
+    const result = await invokeResticForget(
+      {
+        keepLast,
+        keepDaily,
+        keepWeekly,
+        keepMonthly,
+        dryRun: args.dryRun,
+        host: args.host,
+      },
+      repository,
+      secrets,
+      resticPath,
+      cwd,
+    );
 
     if (!result.success) {
       throw new Error(
