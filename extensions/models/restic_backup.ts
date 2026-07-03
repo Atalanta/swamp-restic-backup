@@ -44,11 +44,7 @@ import {
   SnapshotsSchema,
 } from "./_lib/schemas.ts";
 import { checkRestoreTargetSafety } from "./_lib/path-safety.ts";
-import {
-  extractSecrets,
-  redactSecrets,
-  validateSecrets,
-} from "./_lib/secrets.ts";
+import { redactSecrets } from "./_lib/secrets.ts";
 import {
   decodeResticCheckOutput,
   decodeResticOutput,
@@ -57,6 +53,7 @@ import {
   parseResticJsonOutput,
   probeResticCapability,
 } from "./_lib/invoker.ts";
+import { runSecretPreflight } from "./_lib/preflight.ts";
 
 // Re-export the public surface this module exposed before the _lib/ split, so
 // the extension's public API is unchanged by the refactor.
@@ -208,25 +205,9 @@ export const model = {
         _args: z.infer<typeof InitArgsSchema>,
         context: MethodContext,
       ) => {
-        const secretError = validateSecrets(context.globalArgs);
-        if (secretError !== null) {
-          throw new Error(
-            `Secret validation failed before calling restic: ${secretError}`,
-          );
-        }
-
-        const secrets = extractSecrets(context.globalArgs);
-        const cwd = context.globalArgs.repoDir;
-        const resticPath = context.globalArgs.resticPath;
-        const repository = context.globalArgs.repository;
-
-        // Verify --json capability before any operational call
-        const probe = await probeResticCapability(resticPath, cwd);
-        if (!probe.supported) {
-          throw new Error(
-            `restic does not support --json: ${redactSecrets(probe.message, secrets)}`,
-          );
-        }
+        const { secrets, cwd, resticPath, repository } = await runSecretPreflight(
+          context.globalArgs,
+        );
 
         // Idempotency probe: check whether the repository is already accessible
         // by running `restic cat config --json` before attempting init.
@@ -325,24 +306,9 @@ export const model = {
         args: z.infer<typeof BackupArgsSchema>,
         context: MethodContext,
       ) => {
-        const secretError = validateSecrets(context.globalArgs);
-        if (secretError !== null) {
-          throw new Error(
-            `Secret validation failed before calling restic: ${secretError}`,
-          );
-        }
-
-        const secrets = extractSecrets(context.globalArgs);
-        const cwd = context.globalArgs.repoDir;
-        const resticPath = context.globalArgs.resticPath;
-        const repository = context.globalArgs.repository;
-
-        const probe = await probeResticCapability(resticPath, cwd);
-        if (!probe.supported) {
-          throw new Error(
-            `restic does not support --json: ${redactSecrets(probe.message, secrets)}`,
-          );
-        }
+        const { secrets, cwd, resticPath, repository } = await runSecretPreflight(
+          context.globalArgs,
+        );
 
         const { includePaths, excludePatterns } = buildIncludeExcludeLists(
           context.globalArgs,
@@ -442,24 +408,9 @@ export const model = {
         args: z.infer<typeof SnapshotsArgsSchema>,
         context: MethodContext,
       ) => {
-        const secretError = validateSecrets(context.globalArgs);
-        if (secretError !== null) {
-          throw new Error(
-            `Secret validation failed before calling restic: ${secretError}`,
-          );
-        }
-
-        const secrets = extractSecrets(context.globalArgs);
-        const cwd = context.globalArgs.repoDir;
-        const resticPath = context.globalArgs.resticPath;
-        const repository = context.globalArgs.repository;
-
-        const probe = await probeResticCapability(resticPath, cwd);
-        if (!probe.supported) {
-          throw new Error(
-            `restic does not support --json: ${redactSecrets(probe.message, secrets)}`,
-          );
-        }
+        const { secrets, cwd, resticPath, repository } = await runSecretPreflight(
+          context.globalArgs,
+        );
 
         const argv: string[] = [resticPath, "snapshots", "--json", "--repo", repository];
         if (args.host) {
@@ -541,24 +492,9 @@ export const model = {
         _args: z.infer<typeof CheckArgsSchema>,
         context: MethodContext,
       ) => {
-        const secretError = validateSecrets(context.globalArgs);
-        if (secretError !== null) {
-          throw new Error(
-            `Secret validation failed before calling restic: ${secretError}`,
-          );
-        }
-
-        const secrets = extractSecrets(context.globalArgs);
-        const cwd = context.globalArgs.repoDir;
-        const resticPath = context.globalArgs.resticPath;
-        const repository = context.globalArgs.repository;
-
-        const probe = await probeResticCapability(resticPath, cwd);
-        if (!probe.supported) {
-          throw new Error(
-            `restic does not support --json: ${redactSecrets(probe.message, secrets)}`,
-          );
-        }
+        const { secrets, cwd, resticPath, repository } = await runSecretPreflight(
+          context.globalArgs,
+        );
 
         const result = await invokeRestic(
           [resticPath, "check", "--json", "--repo", repository],
@@ -650,24 +586,9 @@ export const model = {
           );
         }
 
-        const secretError = validateSecrets(context.globalArgs);
-        if (secretError !== null) {
-          throw new Error(
-            `Secret validation failed before calling restic: ${secretError}`,
-          );
-        }
-
-        const secrets = extractSecrets(context.globalArgs);
-        const cwd = context.globalArgs.repoDir;
-        const resticPath = context.globalArgs.resticPath;
-        const repository = context.globalArgs.repository;
-
-        const probe = await probeResticCapability(resticPath, cwd);
-        if (!probe.supported) {
-          throw new Error(
-            `restic does not support --json: ${redactSecrets(probe.message, secrets)}`,
-          );
-        }
+        const { secrets, cwd, resticPath, repository } = await runSecretPreflight(
+          context.globalArgs,
+        );
 
         const result = await invokeRestic(
           [
@@ -750,24 +671,9 @@ export const model = {
         args: z.infer<typeof ForgetArgsSchema>,
         context: MethodContext,
       ) => {
-        const secretError = validateSecrets(context.globalArgs);
-        if (secretError !== null) {
-          throw new Error(
-            `Secret validation failed before calling restic: ${secretError}`,
-          );
-        }
-
-        const secrets = extractSecrets(context.globalArgs);
-        const cwd = context.globalArgs.repoDir;
-        const resticPath = context.globalArgs.resticPath;
-        const repository = context.globalArgs.repository;
-
-        const probe = await probeResticCapability(resticPath, cwd);
-        if (!probe.supported) {
-          throw new Error(
-            `restic does not support --json: ${redactSecrets(probe.message, secrets)}`,
-          );
-        }
+        const { secrets, cwd, resticPath, repository } = await runSecretPreflight(
+          context.globalArgs,
+        );
 
         // Merge method-level retention args with globalArgs defaults —
         // method-level args take precedence, then fall back to global retention policy
@@ -841,24 +747,9 @@ export const model = {
         _args: z.infer<typeof PruneArgsSchema>,
         context: MethodContext,
       ) => {
-        const secretError = validateSecrets(context.globalArgs);
-        if (secretError !== null) {
-          throw new Error(
-            `Secret validation failed before calling restic: ${secretError}`,
-          );
-        }
-
-        const secrets = extractSecrets(context.globalArgs);
-        const cwd = context.globalArgs.repoDir;
-        const resticPath = context.globalArgs.resticPath;
-        const repository = context.globalArgs.repository;
-
-        const probe = await probeResticCapability(resticPath, cwd);
-        if (!probe.supported) {
-          throw new Error(
-            `restic does not support --json: ${redactSecrets(probe.message, secrets)}`,
-          );
-        }
+        const { secrets, cwd, resticPath, repository } = await runSecretPreflight(
+          context.globalArgs,
+        );
 
         const startTime = performance.now();
         const result = await invokeRestic(
