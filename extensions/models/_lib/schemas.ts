@@ -231,6 +231,18 @@ export const ResticBackupSummarySchema = z.object({
 }).passthrough();
 
 /**
+ * A restic RFC3339 timestamp string. Validated as a string that MUST parse to a
+ * finite epoch time — snapshot `time` is consumed as a Date.parse sort key when
+ * selecting the latest snapshot, so a drifted value like "not-a-date" (which
+ * Date.parse turns into NaN and would silently mis-order the sort) must fail at
+ * the boundary rather than produce a wrong latestSnapshotId.
+ */
+const ResticTimestamp = z.string().refine(
+  (value) => Number.isFinite(Date.parse(value)),
+  { message: "not a parseable timestamp" },
+);
+
+/**
  * Shape of a single snapshot object (used in snapshots[], forget keep[], remove[]).
  * Required (consumed by code): id, short_id, time, hostname, paths.
  * Optional: username (absent on older restic — map absent → ""),
@@ -240,7 +252,7 @@ export const ResticBackupSummarySchema = z.object({
 export const ResticSnapshotSchema = z.object({
   id: z.string(),
   short_id: z.string(),
-  time: z.string(),
+  time: ResticTimestamp,
   hostname: z.string(),
   paths: z.array(z.string()),
   username: z.string().optional(),

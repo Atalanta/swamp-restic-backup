@@ -2344,6 +2344,76 @@ Deno.test("ISSUE-3/S1: ResticSnapshotArraySchema rejects snapshot missing requir
   assertEquals(result.success, false, "Must reject snapshot missing required 'id' field");
 });
 
+Deno.test("ISSUE-3/CORR-3: ResticSnapshotArraySchema rejects a snapshot with a non-parseable time", () => {
+  // time is consumed as a Date.parse sort key; a drifted value like "not-a-date"
+  // would become NaN and silently mis-order latest selection. It must fail at the
+  // boundary instead.
+  const badTimeSnapshots = [
+    {
+      id: "abc123def456",
+      short_id: "abc1",
+      time: "not-a-date",
+      hostname: "host1",
+      paths: ["/tmp"],
+    },
+  ];
+  const result = ResticSnapshotArraySchema.safeParse(badTimeSnapshots);
+  assertEquals(result.success, false, "Must reject snapshot whose time is not a parseable timestamp");
+});
+
+Deno.test("ISSUE-3/CORR-3: snapshots — non-parseable snapshot time fails before writeResource", async () => {
+  // A fake binary that returns a snapshots array with a drifted time value on exit 0.
+  const driftedSnapshots = JSON.stringify([
+    {
+      id: "abc123def456",
+      short_id: "abc1",
+      time: "not-a-date",
+      hostname: "host1",
+      username: "u",
+      paths: ["/tmp"],
+    },
+  ]);
+  const tmpDir = await Deno.makeTempDir({ prefix: "swamp-i3-snap-badtime-" });
+  const callCountFile = `${tmpDir}/call-count`;
+  const fakeBinary = `${tmpDir}/fake-restic`;
+  await Deno.writeTextFile(
+    fakeBinary,
+    `#!/bin/sh
+COUNT=0
+if [ -f "${callCountFile}" ]; then COUNT=$(cat "${callCountFile}"); fi
+COUNT=$((COUNT + 1))
+printf '%s' "$COUNT" > "${callCountFile}"
+if [ "$COUNT" -eq 1 ]; then
+  echo '{"message_type":"version","version":"0.18.1","go_version":"go1.25","go_os":"darwin","go_arch":"arm64"}'
+  exit 0
+fi
+echo '${driftedSnapshots}'
+exit 0
+`,
+  );
+  await Deno.chmod(fakeBinary, 0o755);
+
+  try {
+    const { context, writes } = makeContext({
+      repository: `${tmpDir}/repo`,
+      repoDir: tmpDir,
+      resticPath: fakeBinary,
+      resticPassword: "pass",
+      b2AccountId: "id",
+      b2AccountKey: "key",
+    });
+
+    await assertRejects(
+      () => model.methods.snapshots.execute({ tags: [] }, context),
+      Error,
+      "did not match expected shape",
+    );
+    assertEquals(writes.length, 0, "Must NOT write a snapshots resource on drifted time");
+  } finally {
+    await Deno.remove(tmpDir, { recursive: true });
+  }
+});
+
 Deno.test("ISSUE-3/S1: tagless snapshot (no tags field) still parses", () => {
   // A snapshot with no tags field must be accepted — tags is OPTIONAL.
   const taglessSnapshot = [
