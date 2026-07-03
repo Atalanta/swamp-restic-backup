@@ -30,7 +30,9 @@ import {
   findJsonlMessage,
   parseResticJsonOutput,
 } from "./_lib/invoker.ts";
+import { runSecretPreflight } from "./_lib/preflight.ts";
 import {
+  type GlobalArgs,
   ResticBackupSummarySchema,
   ResticCheckSummarySchema,
   ResticForgetArraySchema,
@@ -3149,4 +3151,148 @@ Deno.test({
       await Deno.remove(stagingDir, { recursive: true });
     }
   },
+});
+
+// ===========================================================================
+// ISSUE-7: shared secret-bearing pre-flight (runSecretPreflight)
+// ===========================================================================
+
+// S1: unit tests on runSecretPreflight.
+Deno.test("ISSUE-7/S1: runSecretPreflight returns the four fields on valid globalArgs", async () => {
+  const tmpDir = await Deno.makeTempDir({ prefix: "swamp-i7-pf-ok-" });
+  const fakeBinary = `${tmpDir}/fake-restic`;
+  await Deno.writeTextFile(
+    fakeBinary,
+    `#!/bin/sh
+echo '{"message_type":"version","version":"0.18.1","go_version":"go1.25","go_os":"darwin","go_arch":"arm64"}'
+exit 0
+`,
+  );
+  await Deno.chmod(fakeBinary, 0o755);
+  try {
+    const globalArgs = makeGlobalArgs({
+      repository: "b2:bucket:path",
+      repoDir: tmpDir,
+      resticPath: fakeBinary,
+      resticPassword: "pw",
+      b2AccountId: "id",
+      b2AccountKey: "key",
+    });
+    const pf = await runSecretPreflight(globalArgs as GlobalArgs);
+    assertEquals(pf.cwd, tmpDir);
+    assertEquals(pf.resticPath, fakeBinary);
+    assertEquals(pf.repository, "b2:bucket:path");
+    assertEquals(pf.secrets.resticPassword, "pw");
+    assertEquals(pf.secrets.b2AccountId, "id");
+    assertEquals(pf.secrets.b2AccountKey, "key");
+  } finally {
+    await Deno.remove(tmpDir, { recursive: true });
+  }
+});
+
+Deno.test("ISSUE-7/S1: runSecretPreflight throws the missing-secrets message on a blank secret", async () => {
+  const globalArgs = makeGlobalArgs({
+    resticPassword: "", // blank → validation fails
+  });
+  const err = await assertRejects(
+    () => runSecretPreflight(globalArgs as GlobalArgs),
+    Error,
+  );
+  assertStringIncludes(err.message, "Secret validation failed before calling restic:");
+});
+
+Deno.test("ISSUE-7/S1: runSecretPreflight throws the no---json message with probe.message redacted", async () => {
+  // Fake binary whose version probe FAILS and echoes the (canary) password value,
+  // so redactSecrets must scrub it from the thrown message.
+  const CANARY = "CANARY_I7_PREFLIGHT_PROBE_xK9mQ3_MUST_NOT_LEAK";
+  const tmpDir = await Deno.makeTempDir({ prefix: "swamp-i7-pf-probe-" });
+  const fakeBinary = `${tmpDir}/fake-restic`;
+  await Deno.writeTextFile(
+    fakeBinary,
+    `#!/bin/sh
+# version probe fails and emits the canary on STDERR (probeResticCapability
+# surfaces stderr in probe.message on a non-zero exit).
+printf 'boom: ${CANARY}' >&2
+exit 3
+`,
+  );
+  await Deno.chmod(fakeBinary, 0o755);
+  try {
+    const globalArgs = makeGlobalArgs({
+      repoDir: tmpDir,
+      resticPath: fakeBinary,
+      resticPassword: CANARY, // configured value == what the probe echoes → must be redacted
+      b2AccountId: "id",
+      b2AccountKey: "key",
+    });
+    const err = await assertRejects(
+      () => runSecretPreflight(globalArgs as GlobalArgs),
+      Error,
+    );
+    assertStringIncludes(err.message, "restic does not support --json:");
+    assertEquals(
+      err.message.includes(CANARY),
+      false,
+      "probe.message canary must be redacted in the no---json failure",
+    );
+    assertStringIncludes(err.message, "[REDACTED]");
+  } finally {
+    await Deno.remove(tmpDir, { recursive: true });
+  }
+});
+
+// S5: acceptance proof through the REAL entrypoints (model.methods.<name>.execute).
+Deno.test("ISSUE-7/S5: backup.execute rejects with the missing-secrets message before any restic spawn", async () => {
+  // Blank secrets → runSecretPreflight must throw before the binary is invoked.
+  // A resticPath that does not exist proves no spawn happened (would fail differently).
+  const { context, writes } = makeContext({
+    resticPath: "/nonexistent/restic-should-not-run",
+    resticPassword: "",
+    b2AccountId: "",
+    b2AccountKey: "",
+  });
+  const err = await assertRejects(
+    () => model.methods.backup.execute({ tags: [] }, context),
+    Error,
+  );
+  assertStringIncludes(err.message, "Secret validation failed before calling restic:");
+  assertEquals(writes.length, 0, "no resource written when pre-flight rejects");
+});
+
+Deno.test("ISSUE-7/S5: backup.execute rejects with the no---json message and redacts the probe canary", async () => {
+  const CANARY = "CANARY_I7_S5_PROBE_pR7nW2_MUST_NOT_LEAK";
+  const tmpDir = await Deno.makeTempDir({ prefix: "swamp-i7-s5-" });
+  const fakeBinary = `${tmpDir}/fake-restic`;
+  await Deno.writeTextFile(
+    fakeBinary,
+    `#!/bin/sh
+# version probe fails and echoes the canary secret value on STDERR
+printf 'unsupported: ${CANARY}' >&2
+exit 2
+`,
+  );
+  await Deno.chmod(fakeBinary, 0o755);
+  try {
+    const { context, writes } = makeContext({
+      repoDir: tmpDir,
+      resticPath: fakeBinary,
+      resticPassword: CANARY,
+      b2AccountId: "id",
+      b2AccountKey: "key",
+    });
+    const err = await assertRejects(
+      () => model.methods.backup.execute({ tags: [] }, context),
+      Error,
+    );
+    assertStringIncludes(err.message, "restic does not support --json:");
+    assertEquals(
+      err.message.includes(CANARY),
+      false,
+      "the canary probe message must be redacted through the extracted pre-flight",
+    );
+    assertStringIncludes(err.message, "[REDACTED]");
+    assertEquals(writes.length, 0, "no resource written when the probe fails");
+  } finally {
+    await Deno.remove(tmpDir, { recursive: true });
+  }
 });

@@ -154,6 +154,9 @@ export const GlobalArgsSchema = z.object({
   ),
 });
 
+/** The resolved global arguments a model method receives (schema-inferred). */
+export type GlobalArgs = z.infer<typeof GlobalArgsSchema>;
+
 // =============================================================================
 // Method Argument Schemas
 // =============================================================================

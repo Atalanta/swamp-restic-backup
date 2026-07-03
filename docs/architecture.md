@@ -46,7 +46,7 @@ C4Container
 ## Components (Model definition)
 
 The "Model definition" container is the entry file
-`extensions/models/restic_backup.ts` (the manifest's model entry) plus five
+`extensions/models/restic_backup.ts` (the manifest's model entry) plus six
 sibling modules under `extensions/models/_lib/`. The entry holds the eight
 method bodies and the `MethodContext` port; each other concern is its own module
 with boundaries enforced by the import graph.
@@ -55,6 +55,7 @@ with boundaries enforced by the import graph.
 C4Component
     Container_Boundary(model, "Model definition") {
         Component(methods, "Entry (restic_backup.ts)", "module", "8 method execute() bodies, MethodContext port, composition of the _lib modules")
+        Component(preflight, "_lib/preflight.ts", "module", "runSecretPreflight — sole definition of the secret-bearing prologue (validate → extract → read args → probe) shared by the seven operational methods; composes secrets + invoker")
         Component(secrets, "_lib/secrets.ts", "module", "validateSecrets, extractSecrets, redactSecrets, ResticSecrets — sole producer of resolved secret values")
         Component(invoker, "_lib/invoker.ts", "module", "invokeRestic, invokeResticNoSecrets, probeResticCapability, parse helpers, ResticResult — sole owner of Deno.Command (spawnRestic is module-private)")
         Component(pathsafety, "_lib/path-safety.ts", "module", "normalizePosixPath, resolvePathWithAncestor, checkRestoreTargetSafety")
@@ -62,12 +63,20 @@ C4Component
         Component(schemas, "_lib/schemas.ts", "module", "arg + result Zod schemas and their inferred types")
     }
 
-    Rel(methods, secrets, "imports")
+    Rel(methods, preflight, "imports")
+    Rel(methods, secrets, "imports (redactSecrets)")
     Rel(methods, invoker, "imports")
     Rel(methods, pathsafety, "imports")
     Rel(methods, policy, "imports")
     Rel(methods, schemas, "imports")
+    Rel(preflight, secrets, "imports")
+    Rel(preflight, invoker, "imports")
 ```
+
+The seven operational methods (`init`, `backup`, `snapshots`, `check`,
+`restore`, `forget`, `prune`) obtain their secrets and repo inputs from
+`runSecretPreflight`; `checkRestic` runs its `--json` probe without secrets and
+does not use the pre-flight.
 
 ## Trust boundaries and invariants
 
