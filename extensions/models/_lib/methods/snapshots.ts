@@ -8,7 +8,7 @@
 
 import { z } from "npm:zod@4.4.3";
 import { SnapshotsArgsSchema, ResticSnapshotArraySchema } from "../schemas.ts";
-import { invokeRestic, decodeResticOutput } from "../invoker.ts";
+import { invokeResticSnapshots, decodeResticOutput } from "../invoker.ts";
 import { runSecretPreflight } from "../preflight.ts";
 import { redactSecrets } from "../secrets.ts";
 import type { MethodContext } from "../method-context.ts";
@@ -24,18 +24,13 @@ export const snapshots = {
       context.globalArgs,
     );
 
-    const argv: string[] = [resticPath, "snapshots", "--json", "--repo", repository];
-    if (args.host) {
-      argv.push("--host", args.host);
-    }
-    for (const tag of args.tags) {
-      argv.push("--tag", tag);
-    }
-    if (args.path) {
-      argv.push("--path", args.path);
-    }
-
-    const result = await invokeRestic(argv, secrets, cwd);
+    const result = await invokeResticSnapshots(
+      { host: args.host, tags: args.tags, path: args.path },
+      repository,
+      secrets,
+      resticPath,
+      cwd,
+    );
 
     if (!result.success) {
       throw new Error(

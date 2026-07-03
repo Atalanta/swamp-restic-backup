@@ -8,7 +8,7 @@
 
 import { z } from "npm:zod@4.4.3";
 import { CheckArgsSchema, ResticCheckSummarySchema } from "../schemas.ts";
-import { invokeRestic, decodeResticCheckOutput } from "../invoker.ts";
+import { invokeResticCheck, decodeResticCheckOutput } from "../invoker.ts";
 import { runSecretPreflight } from "../preflight.ts";
 import { redactSecrets } from "../secrets.ts";
 import type { MethodContext } from "../method-context.ts";
@@ -24,11 +24,7 @@ export const check = {
       context.globalArgs,
     );
 
-    const result = await invokeRestic(
-      [resticPath, "check", "--json", "--repo", repository],
-      secrets,
-      cwd,
-    );
+    const result = await invokeResticCheck(repository, secrets, resticPath, cwd);
 
     // check output is decoded by the invoker-owned, exit-code-aware boundary
     // helper: a valid summary is returned; an exit-0-without-valid-summary is a
