@@ -1,5 +1,5 @@
 /**
- * Secret validation, extraction, and redaction for the restic backup model.
+ * Secret resolution (validate-and-brand) and redaction for the restic backup model.
  *
  * This is the ONLY module that produces or handles resolved secret values.
  * The branded ResolvedSecrets type and its sole producer, resolveSecrets, are
