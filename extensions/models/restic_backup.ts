@@ -31,6 +31,12 @@ import {
   PruneArgsSchema,
   PruneResultSchema,
   RepositoryStatusSchema,
+  ResticBackupSummarySchema,
+  ResticCheckSummarySchema,
+  ResticForgetArraySchema,
+  ResticInitOutputSchema,
+  ResticRestoreSummarySchema,
+  ResticSnapshotArraySchema,
   ResticStatusSchema,
   RestoreArgsSchema,
   RestoreResultSchema,
@@ -44,6 +50,8 @@ import {
   validateSecrets,
 } from "./_lib/secrets.ts";
 import {
+  decodeResticOutput,
+  decodeResticSummary,
   findJsonlMessage,
   invokeRestic,
   parseResticJsonOutput,
@@ -266,27 +274,14 @@ export const model = {
         let message = "";
 
         if (result.success) {
-          // Wrap the parse in a redacting catch: a buggy/hostile restic could exit 0
-          // with malformed JSON that embeds secret values; the SyntaxError message can
-          // then include a raw snippet of the output. We never include raw subprocess
-          // output in the thrown error — only a sanitized summary.
-          let parsed: Record<string, unknown>;
-          try {
-            parsed = JSON.parse(result.stdout.trim()) as Record<string, unknown>;
-          } catch {
-            throw new Error(
-              "restic init --json exited 0 but emitted invalid JSON — cannot parse result",
-            );
-          }
-          if (parsed["message_type"] === "initialized") {
-            created = true;
-            initialized = true;
-            message = `Repository created at ${repository}`;
-          } else {
-            throw new Error(
-              `restic init --json returned unexpected message_type='${parsed["message_type"]}' (expected 'initialized')`,
-            );
-          }
+          // Decode and validate the whole-payload init result via the boundary decoder.
+          // decodeResticOutput parses the stdout and validates it against the Zod schema
+          // (message_type=="initialized" is a required literal — schema mismatch throws
+          // a sanitized boundary error). No raw output is embedded in any error path.
+          decodeResticOutput(result.stdout, ResticInitOutputSchema, "init");
+          created = true;
+          initialized = true;
+          message = `Repository created at ${repository}`;
         } else {
           // init failed — surface the JSON error message if available, otherwise stderr.
           // We do NOT classify the error by message text; all non-zero exits are failures.
@@ -389,31 +384,22 @@ export const model = {
           );
         }
 
-        // The summary message is the last JSONL line with message_type=summary.
-        // Wrap in a redacting catch: a buggy/hostile restic could exit 0 with malformed
-        // JSON that embeds secret values; SyntaxError can include a raw output snippet.
-        let summary: Record<string, unknown> | null;
-        try {
-          summary = findJsonlMessage(result.stdout, "summary");
-        } catch {
-          throw new Error(
-            "restic backup --json exited 0 but emitted invalid JSON — cannot parse result",
-          );
-        }
-        if (summary === null) {
-          throw new Error(
-            "restic backup --json did not emit a summary message — cannot parse result",
-          );
-        }
-
-        const snapshotId = (summary["snapshot_id"] as string) ?? "";
-        const startedAt = (summary["backup_start"] as string) ?? new Date().toISOString();
-        const completedAt = (summary["backup_end"] as string) ?? new Date().toISOString();
-        const fileCount = (summary["total_files_processed"] as number) ?? 0;
-        const byteCount = (summary["total_bytes_processed"] as number) ?? 0;
-        const durationMs = Math.round(
-          ((summary["total_duration"] as number) ?? 0) * 1000,
+        // Decode and validate the JSONL summary line via the boundary decoder.
+        // decodeResticSummary locates the last message_type=='summary' line and
+        // validates it against the Zod schema — fails with a sanitized error on
+        // parse failure, schema mismatch, or missing summary line (all boundary errors).
+        const summary = decodeResticSummary(
+          result.stdout,
+          ResticBackupSummarySchema,
+          "backup",
         );
+
+        const snapshotId = summary.snapshot_id;
+        const startedAt = summary.backup_start;
+        const completedAt = summary.backup_end;
+        const fileCount = summary.total_files_processed;
+        const byteCount = summary.total_bytes_processed;
+        const durationMs = Math.round(summary.total_duration * 1000);
 
         const backupData = {
           snapshotId,
@@ -494,31 +480,31 @@ export const model = {
           );
         }
 
-        // snapshots --json returns a JSON array.
-        // Wrap in a redacting catch: malformed-but-exit-0 stdout could embed secrets.
-        let snapshotArray: Array<Record<string, unknown>>;
-        try {
-          snapshotArray = JSON.parse(result.stdout.trim()) as Array<
-            Record<string, unknown>
-          >;
-        } catch {
-          throw new Error(
-            "restic snapshots --json exited 0 but emitted invalid JSON — cannot parse result",
-          );
-        }
+        // Decode and validate the whole-payload JSON array via the boundary decoder.
+        // decodeResticOutput parses the entire stdout and validates against the Zod
+        // schema — a non-array payload fails at the boundary, not with a TypeError on .map.
+        const snapshotArray = decodeResticOutput(
+          result.stdout,
+          ResticSnapshotArraySchema,
+          "snapshots",
+        );
 
         const snapshots = snapshotArray.map((snap) => ({
-          id: (snap["id"] as string) ?? "",
-          shortId: (snap["short_id"] as string) ?? "",
-          time: (snap["time"] as string) ?? "",
-          hostname: (snap["hostname"] as string) ?? "",
-          paths: (snap["paths"] as string[]) ?? [],
-          tags: (snap["tags"] as string[]) ?? [],
-          username: (snap["username"] as string) ?? "",
+          id: snap.id,
+          shortId: snap.short_id,
+          time: snap.time,
+          hostname: snap.hostname,
+          paths: snap.paths,
+          // username is OPTIONAL in the restic output schema (absent on older restic);
+          // map absent → "" to preserve the public result-resource shape.
+          tags: snap.tags ?? [],
+          username: snap.username ?? "",
         }));
 
+        // Select latest by ordinal time comparison (ISO strings compare correctly
+        // with < / > — NOT localeCompare, which is locale-sensitive).
         const sortedByTime = [...snapshots].sort((a, b) =>
-          a.time.localeCompare(b.time)
+          new Date(a.time) < new Date(b.time) ? -1 : new Date(a.time) > new Date(b.time) ? 1 : 0
         );
         const latest = sortedByTime[sortedByTime.length - 1];
 
@@ -579,25 +565,50 @@ export const model = {
           cwd,
         );
 
-        // check --json emits a summary JSONL line
-        // exit 0 = ok, exit non-zero = errors found.
-        // Wrap in a redacting catch: malformed-but-exit-0 stdout could embed secrets.
-        // Non-empty-but-unparseable stdout is a hard error (consistent with the
-        // invariant that every success-path parse throws a sanitized error on failure).
-        // Empty stdout is legitimately possible if restic emits nothing (non-fatal).
-        let summary: Record<string, unknown> | null;
-        try {
-          summary = findJsonlMessage(result.stdout, "summary");
-        } catch {
-          if (result.stdout.trim() !== "") {
+        // check --json emits a summary JSONL line.
+        // exit 0 = ok, exit non-zero = errors found (a non-zero exit with a well-formed
+        // summary is a VALID integrity-failure result, NOT a shape mismatch).
+        // Only an unparseable or schema-mismatched check SUMMARY triggers the boundary
+        // failure. If no summary line is present (e.g. restic emits exit_error JSON
+        // instead), we treat it as ok:false without raising a boundary error.
+        //
+        // Decode strategy:
+        //   1. Find the last message_type=="summary" line with findJsonlMessage.
+        //      A bad JSONL line (unparseable) is a boundary failure.
+        //   2. If a summary line is found, validate it against the check schema.
+        //      A schema-mismatched summary is a boundary failure.
+        //   3. If no summary line is found (null), fall through to ok:false.
+        let checkSummary: { message_type: "summary"; num_errors: number } | null;
+        if (result.stdout.trim() === "") {
+          checkSummary = null;
+        } else {
+          // Use findJsonlMessage to locate the summary line; sanitized error on bad JSONL.
+          let rawSummary: Record<string, unknown> | null;
+          try {
+            rawSummary = findJsonlMessage(result.stdout, "summary");
+          } catch {
+            // Unparseable JSONL line in non-empty check output → boundary failure.
             throw new Error(
-              "restic check --json exited 0 but emitted invalid JSON — cannot parse result",
+              "restic check: output did not match expected shape — invalid JSON",
             );
           }
-          summary = null;
+          if (rawSummary !== null) {
+            // A summary line exists — validate it against the schema.
+            const validation = ResticCheckSummarySchema.safeParse(rawSummary);
+            if (!validation.success) {
+              throw new Error(
+                "restic check: output did not match expected shape",
+              );
+            }
+            checkSummary = validation.data;
+          } else {
+            // No summary line found (e.g. restic emitted exit_error JSON) — not a
+            // shape mismatch; treat as absence of summary data (ok:false, no num_errors).
+            checkSummary = null;
+          }
         }
 
-        const numErrors = (summary?.["num_errors"] as number) ?? 0;
+        const numErrors = checkSummary?.num_errors ?? 0;
         const ok = result.success && numErrors === 0;
 
         // Collect any error lines (message_type=error) from the JSONL output.
@@ -721,24 +732,18 @@ export const model = {
           );
         }
 
-        // Wrap in a redacting catch: malformed-but-exit-0 stdout could embed secrets.
-        // Non-empty-but-unparseable stdout is a hard error (consistent with the
-        // invariant that every success-path parse throws a sanitized error on failure).
-        // Empty stdout means restic emitted no summary (tolerated — counts default to 0).
-        let summary: Record<string, unknown> | null;
-        try {
-          summary = findJsonlMessage(result.stdout, "summary");
-        } catch {
-          if (result.stdout.trim() !== "") {
-            throw new Error(
-              "restic restore --json exited 0 but emitted invalid JSON — cannot parse result",
-            );
-          }
-          summary = null;
-        }
+        // Decode and validate the JSONL summary line via the boundary decoder.
+        // decodeResticSummary locates the last message_type=='summary' line and
+        // validates it — fails with a sanitized error on parse failure, schema
+        // mismatch, or missing summary line (all boundary errors).
+        const restoreSummary = decodeResticSummary(
+          result.stdout,
+          ResticRestoreSummarySchema,
+          "restore",
+        );
 
-        const filesRestored = (summary?.["files_restored"] as number) ?? 0;
-        const bytesRestored = (summary?.["bytes_restored"] as number) ?? 0;
+        const filesRestored = restoreSummary.files_restored;
+        const bytesRestored = restoreSummary.bytes_restored;
 
         const restoreData = {
           snapshotId: args.snapshot,
@@ -817,22 +822,18 @@ export const model = {
           );
         }
 
-        // forget --json returns an array of group objects.
-        // Wrap in a redacting catch: malformed-but-exit-0 stdout could embed secrets.
-        let groups: Array<Record<string, unknown>>;
-        try {
-          groups = JSON.parse(result.stdout.trim()) as Array<
-            Record<string, unknown>
-          >;
-        } catch {
-          throw new Error(
-            "restic forget --json exited 0 but emitted invalid JSON — cannot parse result",
-          );
-        }
+        // Decode and validate the whole-payload JSON array via the boundary decoder.
+        // decodeResticOutput parses the entire stdout and validates against the Zod
+        // schema — fails with a sanitized error on parse failure or schema mismatch.
+        const groups = decodeResticOutput(
+          result.stdout,
+          ResticForgetArraySchema,
+          "forget",
+        );
 
         let totalRemoved = 0;
         for (const group of groups) {
-          const removeList = (group["remove"] as unknown[]) ?? [];
+          const removeList = group.remove ?? [];
           totalRemoved += removeList.length;
         }
 

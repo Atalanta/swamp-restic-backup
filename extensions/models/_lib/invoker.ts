@@ -13,6 +13,7 @@
  * @module
  */
 
+import type { z } from "npm:zod@4.4.3";
 import type { ResticSecrets } from "./secrets.ts";
 
 /** Structured result from running a restic subprocess. */
@@ -192,7 +193,11 @@ export function parseResticJsonOutput(stdout: string): unknown {
 /**
  * Find the last JSONL line matching a message_type predicate.
  * Used to extract specific event types from restic's streaming output.
- * Throws SyntaxError if any non-empty line is not valid JSON.
+ *
+ * Throws a sanitized domain Error (never a raw SyntaxError) on invalid input —
+ * consistent with the no-human-text-parser invariant in parseResticJsonOutput.
+ * A bad JSONL line is rejected with a fixed message that does not embed the
+ * raw line content (which could contain reflected secrets).
  */
 export function findJsonlMessage(
   stdout: string,
@@ -201,12 +206,95 @@ export function findJsonlMessage(
   const lines = stdout.trim().split("\n").filter((line) => line.trim() !== "");
   let found: Record<string, unknown> | null = null;
   for (const line of lines) {
-    const parsed = JSON.parse(line) as Record<string, unknown>;
+    let parsed: Record<string, unknown>;
+    try {
+      parsed = JSON.parse(line) as Record<string, unknown>;
+    } catch {
+      throw new Error(
+        "restic --json output contained a line that is not valid JSON — no human-text fallback",
+      );
+    }
     if (parsed["message_type"] === messageType) {
       found = parsed;
     }
   }
   return found;
+}
+
+// =============================================================================
+// Validating Decode Helpers
+// =============================================================================
+
+/**
+ * Decode and validate a whole-payload restic command output.
+ *
+ * Parses the entire stdout via parseResticJsonOutput then validates the result
+ * against a supplied Zod schema. On parse failure OR schema mismatch, throws
+ * ONE sanitized boundary error naming the command and mismatch class — no raw
+ * restic output, no unobserved exit code.
+ *
+ * Used by: snapshots, check, forget, init.
+ */
+export function decodeResticOutput<T>(
+  stdout: string,
+  schema: z.ZodType<T>,
+  command: string,
+): T {
+  let parsed: unknown;
+  try {
+    parsed = parseResticJsonOutput(stdout);
+  } catch {
+    throw new Error(
+      `restic ${command}: output did not match expected shape — invalid JSON`,
+    );
+  }
+
+  const result = schema.safeParse(parsed);
+  if (!result.success) {
+    throw new Error(
+      `restic ${command}: output did not match expected shape`,
+    );
+  }
+  return result.data;
+}
+
+/**
+ * Decode and validate the last summary JSONL line from a restic command output.
+ *
+ * Uses findJsonlMessage to locate the last line with message_type=='summary',
+ * then validates it against a supplied Zod schema. A missing summary line is
+ * itself a boundary failure. On parse failure OR schema mismatch, throws ONE
+ * sanitized boundary error naming the command and mismatch class.
+ *
+ * Used by: backup, restore.
+ */
+export function decodeResticSummary<T>(
+  stdout: string,
+  schema: z.ZodType<T>,
+  command: string,
+): T {
+  let summary: Record<string, unknown> | null;
+  try {
+    summary = findJsonlMessage(stdout, "summary");
+  } catch {
+    throw new Error(
+      `restic ${command}: output did not match expected shape — invalid JSON`,
+    );
+  }
+
+  if (summary === null) {
+    throw new Error(
+      `restic ${command}: output did not match expected shape — no summary line`,
+    );
+  }
+
+  const result = schema.safeParse(summary);
+  if (!result.success) {
+    throw new Error(
+      `restic ${command}: output did not match expected shape`,
+    );
+  }
+  return result.data;
 }
 
 // =============================================================================

@@ -24,7 +24,20 @@ import {
   DEFAULT_INCLUDE_PATHS,
 } from "./_lib/policy.ts";
 import { checkRestoreTargetSafety } from "./_lib/path-safety.ts";
-import { parseResticJsonOutput } from "./_lib/invoker.ts";
+import {
+  decodeResticOutput,
+  decodeResticSummary,
+  findJsonlMessage,
+  parseResticJsonOutput,
+} from "./_lib/invoker.ts";
+import {
+  ResticBackupSummarySchema,
+  ResticCheckSummarySchema,
+  ResticForgetArraySchema,
+  ResticInitOutputSchema,
+  ResticRestoreSummarySchema,
+  ResticSnapshotArraySchema,
+} from "./_lib/schemas.ts";
 import { model } from "./restic_backup.ts";
 // Public-surface guard: the entry module must keep re-exporting the symbols it
 // exposed before the _lib/ split, so the refactor does not silently change the
@@ -2213,6 +2226,689 @@ exit 0
       await Deno.remove(dir, { recursive: true });
       await Deno.remove(stagingDir, { recursive: true });
     }
+  }
+});
+
+// =============================================================================
+// ISSUE-3: Output schema unit tests (S1–S6 of the ISSUE-3-VALIDATE-OUTPUT plan)
+// =============================================================================
+//
+// Fixtures are verbatim slices of captured restic 0.18.1 output from
+// docs/tickets/3-recon-restic-shapes.md — not hand-authored or abbreviated.
+
+// ---------------------------------------------------------------------------
+// Verbatim captured fixtures (ground-truth from docs/tickets/3-recon-restic-shapes.md)
+// ---------------------------------------------------------------------------
+
+const FIXTURE_INIT = `{"message_type":"initialized","id":"41f72b893fb95668c9f56b4062fec4a08f229199f7eddc02955933a513ae7462","repository":"/tmp/restic-shape-i3/repo"}`;
+
+const FIXTURE_BACKUP_SUMMARY_LINE = `{"message_type":"summary","files_new":1,"files_changed":0,"files_unmodified":2,"dirs_new":0,"dirs_changed":5,"dirs_unmodified":0,"data_blobs":1,"tree_blobs":6,"data_added":3760,"data_added_packed":2454,"total_files_processed":3,"total_bytes_processed":31,"total_duration":0.714235458,"backup_start":"2026-07-03T08:11:21.855069+01:00","backup_end":"2026-07-03T08:11:22.569308+01:00","snapshot_id":"40794fa017d67541694f342e5d7aed40f724fb9f1b6015944c96ee2720c37f71"}`;
+
+// Two-element snapshots array fixture (element 0 is root: no parent, no tags;
+// element 1 has a parent). Both elements have username present.
+const FIXTURE_SNAPSHOTS_ARRAY = `[{"time":"2026-07-03T08:00:50.803314+01:00","tree":"d55567dd8e08984679118ea251101cff644a38c7f931f7ba8d46c4de24d83c38","paths":["/tmp/restic-shape-i3/src/.swamp"],"hostname":"UKFARTMML8397","username":"stephen.nelsonsmith","uid":503,"gid":20,"program_version":"restic 0.18.1","summary":{"backup_start":"2026-07-03T08:00:50.803314+01:00","backup_end":"2026-07-03T08:00:51.537782+01:00","files_new":2,"files_changed":0,"files_unmodified":0,"dirs_new":5,"dirs_changed":0,"dirs_unmodified":0,"data_blobs":2,"tree_blobs":6,"data_added":3320,"data_added_packed":2486,"total_files_processed":2,"total_bytes_processed":29},"id":"c95c1d358d9c73d33b44e7f48097d58dd4dc4ff30eb08730b0b19fbdf1363b44","short_id":"c95c1d35"},{"time":"2026-07-03T08:00:51.60488+01:00","parent":"c95c1d358d9c73d33b44e7f48097d58dd4dc4ff30eb08730b0b19fbdf1363b44","tree":"d55567dd8e08984679118ea251101cff644a38c7f931f7ba8d46c4de24d83c38","paths":["/tmp/restic-shape-i3/src/.swamp"],"hostname":"UKFARTMML8397","username":"stephen.nelsonsmith","uid":503,"gid":20,"program_version":"restic 0.18.1","summary":{"backup_start":"2026-07-03T08:00:51.60488+01:00","backup_end":"2026-07-03T08:00:52.298531+01:00","files_new":0,"files_changed":0,"files_unmodified":2,"dirs_new":0,"dirs_changed":0,"dirs_unmodified":5,"data_blobs":0,"tree_blobs":0,"data_added":0,"data_added_packed":0,"total_files_processed":2,"total_bytes_processed":29},"id":"08031febdae7ce0c784ea1508f7bed5d78f11225365abd07bbc49a38cf5f6620","short_id":"08031feb"}]`;
+
+const FIXTURE_CHECK_SUMMARY_OK = `{"message_type":"summary","num_errors":0,"broken_packs":null,"suggest_repair_index":false,"suggest_prune":false}`;
+
+const FIXTURE_RESTORE_SUMMARY_LINE = `{"message_type":"summary","total_files":8,"files_restored":8,"total_bytes":31,"bytes_restored":31}`;
+
+// Forget group array fixture (verbatim from docs/tickets/3-recon-restic-shapes.md).
+const FIXTURE_FORGET_ARRAY = `[{"tags":null,"host":"UKFARTMML8397","paths":["/tmp/restic-shape-i3/src/.swamp"],"keep":[{"time":"2026-07-03T08:11:21.855069+01:00","parent":"08031febdae7ce0c784ea1508f7bed5d78f11225365abd07bbc49a38cf5f6620","tree":"ba20c905f867799b0eeef1cda4766be6df40644b27aeb377e0b6af166cf2e552","paths":["/tmp/restic-shape-i3/src/.swamp"],"hostname":"UKFARTMML8397","username":"stephen.nelsonsmith","uid":503,"gid":20,"program_version":"restic 0.18.1","summary":{"backup_start":"2026-07-03T08:11:21.855069+01:00","backup_end":"2026-07-03T08:11:22.569308+01:00","files_new":1,"files_changed":0,"files_unmodified":2,"dirs_new":0,"dirs_changed":5,"dirs_unmodified":0,"data_blobs":1,"tree_blobs":6,"data_added":3760,"data_added_packed":2454,"total_files_processed":3,"total_bytes_processed":31},"id":"40794fa017d67541694f342e5d7aed40f724fb9f1b6015944c96ee2720c37f71","short_id":"40794fa0"}],"remove":[{"time":"2026-07-03T08:00:50.803314+01:00","tree":"d55567dd8e08984679118ea251101cff644a38c7f931f7ba8d46c4de24d83c38","paths":["/tmp/restic-shape-i3/src/.swamp"],"hostname":"UKFARTMML8397","username":"stephen.nelsonsmith","uid":503,"gid":20,"program_version":"restic 0.18.1","summary":{"backup_start":"2026-07-03T08:00:50.803314+01:00","backup_end":"2026-07-03T08:00:51.537782+01:00","files_new":2,"files_changed":0,"files_unmodified":0,"dirs_new":5,"dirs_changed":0,"dirs_unmodified":0,"data_blobs":2,"tree_blobs":6,"data_added":3320,"data_added_packed":2486,"total_files_processed":2,"total_bytes_processed":29},"id":"c95c1d358d9c73d33b44e7f48097d58dd4dc4ff30eb08730b0b19fbdf1363b44","short_id":"c95c1d35"}],"reasons":[{"snapshot":{"time":"2026-07-03T08:11:21.855069+01:00","parent":"08031febdae7ce0c784ea1508f7bed5d78f11225365abd07bbc49a38cf5f6620","paths":["/tmp/restic-shape-i3/src/.swamp"],"hostname":"UKFARTMML8397","username":"stephen.nelsonsmith","id":"40794fa017d67541694f342e5d7aed40f724fb9f1b6015944c96ee2720c37f71","short_id":"40794fa0"},"matches":["last snapshot"]}]}]`;
+
+// ---------------------------------------------------------------------------
+// S1: Output schema acceptance tests — each captured fixture must parse
+// ---------------------------------------------------------------------------
+
+Deno.test("ISSUE-3/S1: ResticInitOutputSchema parses captured init fixture", () => {
+  const result = ResticInitOutputSchema.parse(JSON.parse(FIXTURE_INIT));
+  assertEquals(result.message_type, "initialized");
+  assertEquals(result.id, "41f72b893fb95668c9f56b4062fec4a08f229199f7eddc02955933a513ae7462");
+  assertEquals(result.repository, "/tmp/restic-shape-i3/repo");
+});
+
+Deno.test("ISSUE-3/S1: ResticInitOutputSchema rejects missing required field (id absent)", () => {
+  const badInit = { message_type: "initialized", repository: "/tmp/repo" };
+  const result = ResticInitOutputSchema.safeParse(badInit);
+  assertEquals(result.success, false, "Must reject init object missing 'id'");
+});
+
+Deno.test("ISSUE-3/S1: ResticBackupSummarySchema parses captured backup summary fixture", () => {
+  const result = ResticBackupSummarySchema.parse(JSON.parse(FIXTURE_BACKUP_SUMMARY_LINE));
+  assertEquals(result.message_type, "summary");
+  assertEquals(result.snapshot_id, "40794fa017d67541694f342e5d7aed40f724fb9f1b6015944c96ee2720c37f71");
+  assertEquals(result.total_files_processed, 3);
+  assertEquals(result.total_bytes_processed, 31);
+  assertEquals(result.total_duration, 0.714235458);
+});
+
+Deno.test("ISSUE-3/S1: ResticBackupSummarySchema rejects missing required field (snapshot_id absent)", () => {
+  const badSummary = {
+    message_type: "summary",
+    backup_start: "2026-07-03T08:11:21.855069+01:00",
+    backup_end: "2026-07-03T08:11:22.569308+01:00",
+    total_files_processed: 3,
+    total_bytes_processed: 31,
+    total_duration: 0.714,
+  };
+  const result = ResticBackupSummarySchema.safeParse(badSummary);
+  assertEquals(result.success, false, "Must reject backup summary missing 'snapshot_id'");
+});
+
+Deno.test("ISSUE-3/S1: ResticBackupSummarySchema does NOT reject unconsumed passthrough counters", () => {
+  // Passthrough fields (files_new, dirs_changed, etc.) must NOT cause rejection.
+  const withPassthrough = JSON.parse(FIXTURE_BACKUP_SUMMARY_LINE);
+  // Verify passthrough fields are present in the parsed fixture (they come from real output).
+  assertEquals(typeof withPassthrough.files_new, "number", "files_new must be present in fixture");
+  const result = ResticBackupSummarySchema.safeParse(withPassthrough);
+  assertEquals(result.success, true, "Passthrough counters must not cause schema rejection");
+});
+
+Deno.test("ISSUE-3/S1: ResticSnapshotArraySchema parses captured two-element snapshots fixture", () => {
+  const snapshots = ResticSnapshotArraySchema.parse(JSON.parse(FIXTURE_SNAPSHOTS_ARRAY));
+  assertEquals(snapshots.length, 2);
+  assertEquals(snapshots[0].id, "c95c1d358d9c73d33b44e7f48097d58dd4dc4ff30eb08730b0b19fbdf1363b44");
+  assertEquals(snapshots[0].short_id, "c95c1d35");
+  assertEquals(snapshots[0].hostname, "UKFARTMML8397");
+  assertEquals(snapshots[0].username, "stephen.nelsonsmith");
+  // Element 0 is root — no parent field.
+  assertEquals(snapshots[0].parent, undefined, "Root snapshot must have no parent");
+  // Element 1 has parent.
+  assertEquals(snapshots[1].parent, "c95c1d358d9c73d33b44e7f48097d58dd4dc4ff30eb08730b0b19fbdf1363b44");
+});
+
+Deno.test("ISSUE-3/S1: ResticSnapshotArraySchema rejects snapshot with wrong type for paths", () => {
+  const badSnapshots = [
+    {
+      id: "abc123",
+      short_id: "abc1",
+      time: "2026-07-03T08:00:50.803314+01:00",
+      hostname: "host1",
+      paths: "not-an-array",  // must be string[], not string
+    },
+  ];
+  const result = ResticSnapshotArraySchema.safeParse(badSnapshots);
+  assertEquals(result.success, false, "Must reject snapshot where paths is not an array");
+});
+
+Deno.test("ISSUE-3/S1: ResticSnapshotArraySchema rejects snapshot missing required id field", () => {
+  const badSnapshots = [
+    {
+      // id is absent
+      short_id: "abc1",
+      time: "2026-07-03T08:00:50.803314+01:00",
+      hostname: "host1",
+      paths: ["/tmp"],
+    },
+  ];
+  const result = ResticSnapshotArraySchema.safeParse(badSnapshots);
+  assertEquals(result.success, false, "Must reject snapshot missing required 'id' field");
+});
+
+Deno.test("ISSUE-3/S1: tagless snapshot (no tags field) still parses", () => {
+  // A snapshot with no tags field must be accepted — tags is OPTIONAL.
+  const taglessSnapshot = [
+    {
+      id: "abc123def456",
+      short_id: "abc1",
+      time: "2026-07-03T08:00:50.803314+01:00",
+      hostname: "host1",
+      paths: ["/tmp/restic-shape-i3/src/.swamp"],
+      username: "testuser",
+      // tags deliberately absent
+    },
+  ];
+  const result = ResticSnapshotArraySchema.safeParse(taglessSnapshot);
+  assertEquals(result.success, true, "Tagless snapshot must parse successfully");
+  assertEquals(result.data![0].tags, undefined);
+});
+
+Deno.test("ISSUE-3/S1: root snapshot (no parent field) still parses", () => {
+  // A root snapshot with no parent field must be accepted — parent is OPTIONAL.
+  const rootSnapshot = [
+    {
+      id: "abc123def456",
+      short_id: "abc1",
+      time: "2026-07-03T08:00:50.803314+01:00",
+      hostname: "host1",
+      paths: ["/tmp"],
+      username: "testuser",
+      // parent deliberately absent (root snapshot)
+    },
+  ];
+  const result = ResticSnapshotArraySchema.safeParse(rootSnapshot);
+  assertEquals(result.success, true, "Root snapshot (no parent) must parse successfully");
+  assertEquals(result.data![0].parent, undefined);
+});
+
+Deno.test("ISSUE-3/S1: username-absent snapshot still parses (older restic omits it)", () => {
+  // username is OPTIONAL — older restic versions omit it. Must default to undefined
+  // in the schema (the model maps absent → "" on the result shape).
+  const noUsernameSnapshot = [
+    {
+      id: "abc123def456",
+      short_id: "abc1",
+      time: "2026-07-03T08:00:50.803314+01:00",
+      hostname: "host1",
+      paths: ["/tmp"],
+      // username deliberately absent
+    },
+  ];
+  const result = ResticSnapshotArraySchema.safeParse(noUsernameSnapshot);
+  assertEquals(result.success, true, "Username-absent snapshot must parse successfully");
+  assertEquals(result.data![0].username, undefined, "username must be undefined when absent");
+});
+
+Deno.test("ISSUE-3/S1: ResticCheckSummarySchema parses captured check fixture", () => {
+  const result = ResticCheckSummarySchema.parse(JSON.parse(FIXTURE_CHECK_SUMMARY_OK));
+  assertEquals(result.message_type, "summary");
+  assertEquals(result.num_errors, 0);
+  assertEquals(result.broken_packs, null);
+  assertEquals(result.suggest_repair_index, false);
+  assertEquals(result.suggest_prune, false);
+});
+
+Deno.test("ISSUE-3/S1: ResticCheckSummarySchema rejects wrong type for num_errors", () => {
+  const badCheck = {
+    message_type: "summary",
+    num_errors: "not-a-number",  // must be number
+    broken_packs: null,
+    suggest_repair_index: false,
+    suggest_prune: false,
+  };
+  const result = ResticCheckSummarySchema.safeParse(badCheck);
+  assertEquals(result.success, false, "Must reject check summary with wrong type for num_errors");
+});
+
+Deno.test("ISSUE-3/S1: ResticForgetArraySchema parses captured forget fixture", () => {
+  const groups = ResticForgetArraySchema.parse(JSON.parse(FIXTURE_FORGET_ARRAY));
+  assertEquals(groups.length, 1);
+  assertEquals(groups[0].host, "UKFARTMML8397");
+  assertEquals(groups[0].tags, null);
+  assertEquals(groups[0].keep.length, 1);
+  assertEquals(groups[0].remove!.length, 1);
+  assertEquals(groups[0].keep[0].id, "40794fa017d67541694f342e5d7aed40f724fb9f1b6015944c96ee2720c37f71");
+});
+
+Deno.test("ISSUE-3/S1: ResticForgetArraySchema rejects group missing required host field", () => {
+  const badForget = [
+    {
+      // host is absent
+      tags: null,
+      paths: ["/tmp"],
+      keep: [],
+      remove: null,
+    },
+  ];
+  const result = ResticForgetArraySchema.safeParse(badForget);
+  assertEquals(result.success, false, "Must reject forget group missing required 'host' field");
+});
+
+Deno.test("ISSUE-3/S1: ResticRestoreSummarySchema parses captured restore fixture", () => {
+  const result = ResticRestoreSummarySchema.parse(JSON.parse(FIXTURE_RESTORE_SUMMARY_LINE));
+  assertEquals(result.message_type, "summary");
+  assertEquals(result.total_files, 8);
+  assertEquals(result.files_restored, 8);
+  assertEquals(result.total_bytes, 31);
+  assertEquals(result.bytes_restored, 31);
+});
+
+Deno.test("ISSUE-3/S1: ResticRestoreSummarySchema rejects missing required field (bytes_restored absent)", () => {
+  const badRestore = {
+    message_type: "summary",
+    total_files: 8,
+    files_restored: 8,
+    total_bytes: 31,
+    // bytes_restored deliberately absent
+  };
+  const result = ResticRestoreSummarySchema.safeParse(badRestore);
+  assertEquals(result.success, false, "Must reject restore summary missing 'bytes_restored'");
+});
+
+// ---------------------------------------------------------------------------
+// S2: Decoder hygiene tests — findJsonlMessage sanitized error, decodeResticOutput,
+//     decodeResticSummary boundary failures
+// ---------------------------------------------------------------------------
+
+Deno.test("ISSUE-3/S2: findJsonlMessage throws sanitized domain Error on bad JSONL line (not SyntaxError)", () => {
+  // A JSONL stream where one line is not valid JSON must throw a sanitized Error,
+  // never a raw SyntaxError that could embed the bad line content (which might
+  // contain reflected secrets). This is the finding-findjsonlmessage-hygiene fix.
+  const CANARY = "SENSITIVE_CANARY_XK9M_MUST_NOT_APPEAR";
+  const badJsonl = `{"message_type":"status","percent_done":0.5}\nNOT_VALID_JSON_${CANARY}\n{"message_type":"summary"}`;
+  let threw = false;
+  try {
+    findJsonlMessage(badJsonl, "summary");
+  } catch (err) {
+    threw = true;
+    assertEquals(err instanceof Error, true, "Must throw Error (domain error)");
+    assertEquals(
+      err instanceof SyntaxError,
+      false,
+      "Must NOT throw a raw SyntaxError (which embeds the bad line)",
+    );
+    assertEquals(
+      (err as Error).message.includes(CANARY),
+      false,
+      "Sanitized error must NOT embed the canary from the bad line",
+    );
+  }
+  assertEquals(threw, true, "findJsonlMessage must throw on bad JSONL line");
+});
+
+Deno.test("ISSUE-3/S2: decodeResticOutput — malformed/unparseable stdout fails with sanitized command-named error", () => {
+  const malformedStdout = "THIS IS NOT JSON AT ALL";
+  let threw = false;
+  try {
+    decodeResticOutput(malformedStdout, ResticSnapshotArraySchema, "snapshots");
+  } catch (err) {
+    threw = true;
+    assertEquals(err instanceof Error, true, "Must throw Error");
+    assertStringIncludes((err as Error).message, "snapshots", "Error must name the command");
+    assertStringIncludes(
+      (err as Error).message,
+      "did not match expected shape",
+      "Error must describe the mismatch class",
+    );
+    assertEquals(
+      (err as Error).message.includes("THIS IS NOT JSON"),
+      false,
+      "Error must NOT embed raw stdout",
+    );
+    assertEquals(
+      (err as Error).message.includes("exited 0"),
+      false,
+      "Error must NOT contain hardcoded 'exited 0' wording",
+    );
+  }
+  assertEquals(threw, true, "decodeResticOutput must throw on unparseable stdout");
+});
+
+Deno.test("ISSUE-3/S2: decodeResticOutput — schema-drifted stdout fails with sanitized command-named error", () => {
+  // Valid JSON but wrong shape (object where array expected) — schema mismatch.
+  const driftedStdout = '{"message_type":"wrong","id":"abc"}';
+  let threw = false;
+  try {
+    decodeResticOutput(driftedStdout, ResticSnapshotArraySchema, "snapshots");
+  } catch (err) {
+    threw = true;
+    assertEquals(err instanceof Error, true);
+    assertStringIncludes((err as Error).message, "snapshots");
+    assertStringIncludes((err as Error).message, "did not match expected shape");
+    // Must not embed raw output in the error.
+    assertEquals((err as Error).message.includes("wrong"), false, "Must not embed raw output field");
+    assertEquals((err as Error).message.includes("exited 0"), false);
+  }
+  assertEquals(threw, true, "decodeResticOutput must throw on shape-drifted stdout");
+});
+
+Deno.test("ISSUE-3/S2: decodeResticSummary — no summary line fails with sanitized command-named error", () => {
+  // Valid JSONL but no message_type=="summary" line → boundary failure.
+  const noSummaryStdout = `{"message_type":"status","percent_done":0.5}\n{"message_type":"status","percent_done":1.0}`;
+  let threw = false;
+  try {
+    decodeResticSummary(noSummaryStdout, ResticBackupSummarySchema, "backup");
+  } catch (err) {
+    threw = true;
+    assertEquals(err instanceof Error, true);
+    assertStringIncludes((err as Error).message, "backup");
+    assertStringIncludes((err as Error).message, "did not match expected shape");
+    assertEquals((err as Error).message.includes("exited 0"), false);
+  }
+  assertEquals(threw, true, "decodeResticSummary must throw when no summary line is present");
+});
+
+Deno.test("ISSUE-3/S2: decodeResticSummary — malformed JSONL fails with sanitized command-named error", () => {
+  const CANARY = "SENSITIVE_R2_CANARY_9pQm";
+  const badJsonl = `{"message_type":"status"}\nNOT_JSON_${CANARY}`;
+  let threw = false;
+  try {
+    decodeResticSummary(badJsonl, ResticBackupSummarySchema, "backup");
+  } catch (err) {
+    threw = true;
+    assertEquals(err instanceof Error, true);
+    assertStringIncludes((err as Error).message, "backup");
+    assertEquals((err as Error).message.includes(CANARY), false, "Must not embed canary in error");
+    assertEquals((err as Error).message.includes("exited 0"), false);
+  }
+  assertEquals(threw, true, "decodeResticSummary must throw on malformed JSONL");
+});
+
+Deno.test("ISSUE-3/S2: decodeResticSummary — schema-drifted summary line fails with sanitized error", () => {
+  // summary line is valid JSON but fails schema validation (missing required field).
+  const driftedSummaryJsonl = `{"message_type":"status"}\n{"message_type":"summary","total_files":8}`;
+  // Missing files_restored, total_bytes, bytes_restored → fails ResticRestoreSummarySchema.
+  let threw = false;
+  try {
+    decodeResticSummary(driftedSummaryJsonl, ResticRestoreSummarySchema, "restore");
+  } catch (err) {
+    threw = true;
+    assertEquals(err instanceof Error, true);
+    assertStringIncludes((err as Error).message, "restore");
+    assertStringIncludes((err as Error).message, "did not match expected shape");
+    assertEquals((err as Error).message.includes("exited 0"), false);
+  }
+  assertEquals(threw, true, "decodeResticSummary must throw on schema-drifted summary line");
+});
+
+Deno.test("ISSUE-3/S2: decodeResticOutput — valid init fixture parses correctly", () => {
+  // Acceptance test for decodeResticOutput with init fixture.
+  const init = decodeResticOutput(FIXTURE_INIT, ResticInitOutputSchema, "init");
+  assertEquals(init.message_type, "initialized");
+  assertEquals(init.id, "41f72b893fb95668c9f56b4062fec4a08f229199f7eddc02955933a513ae7462");
+});
+
+Deno.test("ISSUE-3/S2: decodeResticSummary — valid backup JSONL fixture parses correctly", () => {
+  // Acceptance test for decodeResticSummary with backup fixture.
+  // Simulate a JSONL stream with a status line followed by the summary line.
+  const jsonlStream = `{"message_type":"status","percent_done":0.5}\n${FIXTURE_BACKUP_SUMMARY_LINE}`;
+  const summary = decodeResticSummary(jsonlStream, ResticBackupSummarySchema, "backup");
+  assertEquals(summary.message_type, "summary");
+  assertEquals(summary.snapshot_id, "40794fa017d67541694f342e5d7aed40f724fb9f1b6015944c96ee2720c37f71");
+  assertEquals(summary.total_files_processed, 3);
+});
+
+// ---------------------------------------------------------------------------
+// S4: snapshots latest selection — ordinal time comparison, not localeCompare
+// ---------------------------------------------------------------------------
+
+Deno.test("ISSUE-3/S4: snapshots selects latest by ordinal time order, not lexicographic", async () => {
+  // Use a fake binary that returns a two-snapshot array where element 0's
+  // timestamp is LATER than element 1 (out-of-file-order). The snapshot method
+  // must select element 0 (which has the later timestamp) as the latest.
+  //
+  // File order: [A (later), B (earlier)] — ordinal sort must pick A as latest.
+  const SNAP_A_ID = "aaaa1111bbbb2222cccc3333dddd4444eeee5555ffff6666aaaa1111bbbb2222";
+  const SNAP_B_ID = "1111aaaa2222bbbb3333cccc4444dddd5555eeee6666ffff1111aaaa2222bbbb";
+  // A is chronologically LATER (2026-07-03T10:00:00 > 2026-07-03T08:00:00).
+  const outOfOrderSnapshots = JSON.stringify([
+    {
+      time: "2026-07-03T10:00:00.000000+01:00",
+      id: SNAP_A_ID,
+      short_id: "aaaa1111",
+      hostname: "host1",
+      paths: ["/tmp"],
+      username: "user",
+      tree: "tree1",
+      uid: 500,
+      gid: 20,
+    },
+    {
+      time: "2026-07-03T08:00:00.000000+01:00",
+      id: SNAP_B_ID,
+      short_id: "1111aaaa",
+      hostname: "host1",
+      paths: ["/tmp"],
+      username: "user",
+      tree: "tree2",
+      uid: 500,
+      gid: 20,
+    },
+  ]);
+
+  const tmpDir = await Deno.makeTempDir({ prefix: "swamp-i3-latest-" });
+  const callCountFile = `${tmpDir}/call-count`;
+  const fakeBinary = `${tmpDir}/fake-restic`;
+  await Deno.writeTextFile(
+    fakeBinary,
+    `#!/bin/sh
+COUNT=0
+if [ -f "${callCountFile}" ]; then COUNT=$(cat "${callCountFile}"); fi
+COUNT=$((COUNT + 1))
+printf '%s' "$COUNT" > "${callCountFile}"
+if [ "$COUNT" -eq 1 ]; then
+  echo '{"message_type":"version","version":"0.18.1","go_version":"go1.25","go_os":"darwin","go_arch":"arm64"}'
+  exit 0
+fi
+echo '${outOfOrderSnapshots}'
+exit 0
+`,
+  );
+  await Deno.chmod(fakeBinary, 0o755);
+
+  try {
+    const { context, writes } = makeContext({
+      repository: `${tmpDir}/repo`,
+      repoDir: tmpDir,
+      resticPath: fakeBinary,
+      resticPassword: "pass",
+      b2AccountId: "id",
+      b2AccountKey: "key",
+    });
+
+    await model.methods.snapshots.execute({ tags: [] }, context);
+
+    assertEquals(writes.length, 1);
+    assertEquals(writes[0].specName, "snapshots");
+    const result = writes[0].data;
+
+    // The snapshot with time 10:00 (SNAP_A) is chronologically later.
+    // Must select SNAP_A_ID as the latest, even though it appears first in the array.
+    assertEquals(
+      result.latestSnapshotId,
+      SNAP_A_ID,
+      `Expected latestSnapshotId to be SNAP_A (10:00 timestamp), got: ${result.latestSnapshotId}`,
+    );
+  } finally {
+    await Deno.remove(tmpDir, { recursive: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// S5: check num_errors > 0 stays valid integrity-failure result (not boundary error)
+// ---------------------------------------------------------------------------
+
+Deno.test("ISSUE-3/S5: check — well-formed summary with num_errors>0 yields integrity-failure result (not boundary error)", async () => {
+  // A fake binary that returns a well-formed check summary with num_errors=3
+  // and exits non-zero. This must yield ok:false checkResult, NOT a boundary error.
+  const checkErrorSummary = JSON.stringify({
+    message_type: "summary",
+    num_errors: 3,
+    broken_packs: null,
+    suggest_repair_index: true,
+    suggest_prune: true,
+  });
+
+  const tmpDir = await Deno.makeTempDir({ prefix: "swamp-i3-check-errors-" });
+  const callCountFile = `${tmpDir}/call-count`;
+  const fakeBinary = `${tmpDir}/fake-restic`;
+  await Deno.writeTextFile(
+    fakeBinary,
+    `#!/bin/sh
+COUNT=0
+if [ -f "${callCountFile}" ]; then COUNT=$(cat "${callCountFile}"); fi
+COUNT=$((COUNT + 1))
+printf '%s' "$COUNT" > "${callCountFile}"
+if [ "$COUNT" -eq 1 ]; then
+  echo '{"message_type":"version","version":"0.18.1","go_version":"go1.25","go_os":"darwin","go_arch":"arm64"}'
+  exit 0
+fi
+echo '${checkErrorSummary}'
+exit 1
+`,
+  );
+  await Deno.chmod(fakeBinary, 0o755);
+
+  try {
+    const { context, writes } = makeContext({
+      repository: `${tmpDir}/repo`,
+      repoDir: tmpDir,
+      resticPath: fakeBinary,
+      resticPassword: "pass",
+      b2AccountId: "id",
+      b2AccountKey: "key",
+    });
+
+    // Must NOT throw — must write ok:false checkResult.
+    await model.methods.check.execute({}, context);
+
+    assertEquals(writes.length, 1, "Must write exactly one checkResult resource");
+    assertEquals(writes[0].specName, "checkResult");
+    assertEquals(writes[0].data.ok, false, "ok must be false when num_errors > 0");
+  } finally {
+    await Deno.remove(tmpDir, { recursive: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// S5: snapshots non-array payload fails at the boundary
+// ---------------------------------------------------------------------------
+
+Deno.test("ISSUE-3/S5: snapshots — non-array stdout fails at boundary (not TypeError on .map)", async () => {
+  // A fake binary that exits 0 and returns a JSON object (not array) for snapshots.
+  // Without boundary decoding, this would cause a TypeError when the code calls .map
+  // on a non-array. With boundary decoding, it must fail cleanly before writeResource.
+  const nonArrayStdout = JSON.stringify({ message_type: "snapshot", id: "abc" });
+
+  const tmpDir = await Deno.makeTempDir({ prefix: "swamp-i3-nonarray-" });
+  const callCountFile = `${tmpDir}/call-count`;
+  const fakeBinary = `${tmpDir}/fake-restic`;
+  await Deno.writeTextFile(
+    fakeBinary,
+    `#!/bin/sh
+COUNT=0
+if [ -f "${callCountFile}" ]; then COUNT=$(cat "${callCountFile}"); fi
+COUNT=$((COUNT + 1))
+printf '%s' "$COUNT" > "${callCountFile}"
+if [ "$COUNT" -eq 1 ]; then
+  echo '{"message_type":"version","version":"0.18.1","go_version":"go1.25","go_os":"darwin","go_arch":"arm64"}'
+  exit 0
+fi
+echo '${nonArrayStdout}'
+exit 0
+`,
+  );
+  await Deno.chmod(fakeBinary, 0o755);
+
+  try {
+    const { context, writes } = makeContext({
+      repository: `${tmpDir}/repo`,
+      repoDir: tmpDir,
+      resticPath: fakeBinary,
+      resticPassword: "pass",
+      b2AccountId: "id",
+      b2AccountKey: "key",
+    });
+
+    const error = await assertRejects(
+      () => model.methods.snapshots.execute({ tags: [] }, context),
+      Error,
+    );
+
+    // Must fail before writeResource.
+    assertEquals(writes.length, 0, "Must not write any resource on boundary failure");
+    // Error must name the command.
+    assertStringIncludes(error.message, "snapshots");
+    assertStringIncludes(error.message, "did not match expected shape");
+    // Must not contain raw output.
+    assertEquals(error.message.includes("message_type"), false, "Must not embed raw output");
+    assertEquals(error.message.includes("exited 0"), false, "Must not contain hardcoded 'exited 0'");
+  } finally {
+    await Deno.remove(tmpDir, { recursive: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// S5: backup/restore with no summary line fails at boundary
+// ---------------------------------------------------------------------------
+
+Deno.test("ISSUE-3/S5: backup — stdout with no summary line fails at boundary before writeResource", async () => {
+  // A fake binary that exits 0 but emits only status lines, no summary line.
+  const noSummaryStdout = `{"message_type":"status","percent_done":0.5}`;
+
+  const tmpDir = await Deno.makeTempDir({ prefix: "swamp-i3-nosummary-backup-" });
+  const callCountFile = `${tmpDir}/call-count`;
+  const fakeBinary = `${tmpDir}/fake-restic`;
+  await Deno.writeTextFile(
+    fakeBinary,
+    `#!/bin/sh
+COUNT=0
+if [ -f "${callCountFile}" ]; then COUNT=$(cat "${callCountFile}"); fi
+COUNT=$((COUNT + 1))
+printf '%s' "$COUNT" > "${callCountFile}"
+if [ "$COUNT" -eq 1 ]; then
+  echo '{"message_type":"version","version":"0.18.1","go_version":"go1.25","go_os":"darwin","go_arch":"arm64"}'
+  exit 0
+fi
+echo '${noSummaryStdout}'
+exit 0
+`,
+  );
+  await Deno.chmod(fakeBinary, 0o755);
+
+  try {
+    const { context, writes } = makeContext({
+      repository: `${tmpDir}/repo`,
+      repoDir: tmpDir,
+      resticPath: fakeBinary,
+      resticPassword: "pass",
+      b2AccountId: "id",
+      b2AccountKey: "key",
+    });
+
+    const error = await assertRejects(
+      () => model.methods.backup.execute({ tags: [] }, context),
+      Error,
+    );
+
+    assertEquals(writes.length, 0, "Must not write any resource on boundary failure");
+    assertStringIncludes(error.message, "backup");
+    assertStringIncludes(error.message, "did not match expected shape");
+    assertEquals(error.message.includes("exited 0"), false);
+  } finally {
+    await Deno.remove(tmpDir, { recursive: true });
+  }
+});
+
+Deno.test("ISSUE-3/S5: restore — stdout with no summary line fails at boundary before writeResource", async () => {
+  // A fake binary for restore that exits 0 but emits only status lines.
+  const noSummaryStdout = `{"message_type":"status","percent_done":0.8}`;
+
+  const tmpDir = await Deno.makeTempDir({ prefix: "swamp-i3-nosummary-restore-" });
+  const stagingDir = await Deno.makeTempDir({ prefix: "swamp-i3-nosummary-restore-staging-" });
+  const callCountFile = `${tmpDir}/call-count`;
+  const fakeBinary = `${tmpDir}/fake-restic`;
+  await Deno.writeTextFile(
+    fakeBinary,
+    `#!/bin/sh
+COUNT=0
+if [ -f "${callCountFile}" ]; then COUNT=$(cat "${callCountFile}"); fi
+COUNT=$((COUNT + 1))
+printf '%s' "$COUNT" > "${callCountFile}"
+if [ "$COUNT" -eq 1 ]; then
+  echo '{"message_type":"version","version":"0.18.1","go_version":"go1.25","go_os":"darwin","go_arch":"arm64"}'
+  exit 0
+fi
+echo '${noSummaryStdout}'
+exit 0
+`,
+  );
+  await Deno.chmod(fakeBinary, 0o755);
+
+  try {
+    const { context, writes } = makeContext({
+      repository: `${tmpDir}/repo`,
+      repoDir: tmpDir,
+      resticPath: fakeBinary,
+      resticPassword: "pass",
+      b2AccountId: "id",
+      b2AccountKey: "key",
+    });
+
+    const error = await assertRejects(
+      () => model.methods.restore.execute(
+        { snapshot: "latest", targetDir: stagingDir, confirm: false },
+        context,
+      ),
+      Error,
+    );
+
+    assertEquals(writes.length, 0, "Must not write any resource on boundary failure");
+    assertStringIncludes(error.message, "restore");
+    assertStringIncludes(error.message, "did not match expected shape");
+    assertEquals(error.message.includes("exited 0"), false);
+  } finally {
+    await Deno.remove(tmpDir, { recursive: true });
+    await Deno.remove(stagingDir, { recursive: true });
   }
 });
 

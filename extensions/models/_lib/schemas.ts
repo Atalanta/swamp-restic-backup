@@ -194,3 +194,102 @@ export const ForgetArgsSchema = z.object({
 });
 
 export const PruneArgsSchema = z.object({});
+
+// =============================================================================
+// Restic OUTPUT Schemas (validate raw restic --json output at the boundary)
+// =============================================================================
+// These are DISTINCT from the written-result schemas above. They represent the
+// shapes that restic itself emits, not the shapes we store in swamp resources.
+// All fields are verified verbatim against restic 0.18.1 output captured in
+// docs/tickets/3-recon-restic-shapes.md.
+
+/**
+ * Shape of `restic init --json` stdout (whole-payload, single object).
+ * Required: message_type ("initialized"), id, repository.
+ */
+export const ResticInitOutputSchema = z.object({
+  message_type: z.literal("initialized"),
+  id: z.string(),
+  repository: z.string(),
+}).passthrough();
+
+/**
+ * Shape of the last `message_type=="summary"` JSONL line from `restic backup --json`.
+ * Required (consumed): message_type, snapshot_id, backup_start, backup_end,
+ *   total_files_processed, total_bytes_processed, total_duration.
+ * Passthrough: files_new, files_changed, files_unmodified, dirs_*, data_blobs,
+ *   tree_blobs, data_added, data_added_packed (present in real output; not consumed).
+ */
+export const ResticBackupSummarySchema = z.object({
+  message_type: z.literal("summary"),
+  snapshot_id: z.string(),
+  backup_start: z.string(),
+  backup_end: z.string(),
+  total_files_processed: z.number(),
+  total_bytes_processed: z.number(),
+  total_duration: z.number(),
+}).passthrough();
+
+/**
+ * Shape of a single snapshot object (used in snapshots[], forget keep[], remove[]).
+ * Required (consumed by code): id, short_id, time, hostname, paths.
+ * Optional: username (absent on older restic — map absent → ""),
+ *   tags (absent when untagged), parent (absent on root snapshots), excludes.
+ * Passthrough: tree, uid, gid, program_version, summary (object).
+ */
+export const ResticSnapshotSchema = z.object({
+  id: z.string(),
+  short_id: z.string(),
+  time: z.string(),
+  hostname: z.string(),
+  paths: z.array(z.string()),
+  username: z.string().optional(),
+  tags: z.array(z.string()).optional(),
+  parent: z.string().optional(),
+  excludes: z.array(z.string()).optional(),
+}).passthrough();
+
+/** Array of ResticSnapshotSchema — shape of `restic snapshots --json` whole-payload. */
+export const ResticSnapshotArraySchema = z.array(ResticSnapshotSchema);
+
+/**
+ * Shape of `restic check --json` stdout (whole-payload, single object).
+ * A well-formed summary with num_errors > 0 (non-zero exit) is a VALID
+ * integrity-failure result — NOT a shape mismatch.
+ */
+export const ResticCheckSummarySchema = z.object({
+  message_type: z.literal("summary"),
+  num_errors: z.number(),
+  broken_packs: z.array(z.unknown()).nullable(),
+  suggest_repair_index: z.boolean(),
+  suggest_prune: z.boolean(),
+}).passthrough();
+
+/**
+ * Shape of a single group in `restic forget --json` output (whole-payload, array).
+ * Per group: tags (null|string[]), host, paths, keep (snapshot[]), remove
+ *   (snapshot[]|null), reasons (passthrough — not consumed by code).
+ */
+export const ResticForgetGroupSchema = z.object({
+  tags: z.array(z.string()).nullable(),
+  host: z.string(),
+  paths: z.array(z.string()),
+  keep: z.array(ResticSnapshotSchema),
+  remove: z.array(ResticSnapshotSchema).nullable(),
+}).passthrough();
+
+/** Array of ResticForgetGroupSchema — shape of `restic forget --json` whole-payload. */
+export const ResticForgetArraySchema = z.array(ResticForgetGroupSchema);
+
+/**
+ * Shape of the last `message_type=="summary"` JSONL line from `restic restore --json`.
+ * All fields required: message_type, total_files, files_restored,
+ *   total_bytes, bytes_restored.
+ */
+export const ResticRestoreSummarySchema = z.object({
+  message_type: z.literal("summary"),
+  total_files: z.number(),
+  files_restored: z.number(),
+  total_bytes: z.number(),
+  bytes_restored: z.number(),
+}).passthrough();
