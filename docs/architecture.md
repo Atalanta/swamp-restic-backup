@@ -95,7 +95,7 @@ C4Component
     Rel(methodmodules, pathsafety, "imports")
     Rel(methodmodules, methodeffects, "imports MethodEffects for clock/cwd seams")
     Rel(commands, pathsafety, "imports SafeRestoreTarget (type)")
-    Rel(commands, spawn, "delegates to invokeResticInternal / invokeResticNoSecrets")
+    Rel(commands, spawn, "calls realSpawn / invokeResticNoSecrets")
     Rel(methodmodules, policy, "imports")
     Rel(methodmodules, schemas, "imports")
     Rel(preflight, secrets, "imports")
