@@ -17,7 +17,7 @@ workspace "restic-backup" "C4 model of the @atalanta/restic-backup swamp model e
                 schemas = component "_lib/schemas.ts" "arg + result Zod schemas and their inferred types."
                 secrets = component "_lib/secrets.ts" "resolveSecrets (sole producer of the branded, unforgeable ResolvedSecrets), redactSecrets — the type makes an unvalidated secret reaching restic unrepresentable."
                 invoker = component "_lib/invoker.ts" "invokeRestic, invokeResticNoSecrets, probeResticCapability, parse helpers, ResticResult — sole owner of Deno.Command (spawnRestic is module-private)."
-                pathsafety = component "_lib/path-safety.ts" "normalizePosixPath, resolvePathWithAncestor, checkRestoreTargetSafety — refuses dangerous restore targets."
+                pathsafety = component "_lib/path-safety.ts" "normalizePosixPath, resolvePathWithAncestor, checkRestoreTargetSafety, resolveRestoreTarget — sole producer of the branded, unforgeable SafeRestoreTarget (POSIX-only; refuses a non-POSIX absolute target). The restic restore call accepts only a SafeRestoreTarget, so an unchecked target cannot reach restic."
                 policy = component "_lib/policy.ts" "DEFAULT_INCLUDE_PATHS, DEFAULT_EXCLUDE_PATTERNS, buildIncludeExcludeLists — sole source of the curated .swamp/ subset."
                 preflight = component "_lib/preflight.ts" "runSecretPreflight — sole definition of the secret-bearing prologue (resolveSecrets → ResolvedSecrets, read cwd/resticPath/repository, probe --json) shared by the seven operational methods; composes secrets + invoker. checkRestic does not use it (no-secret probe)."
             }
@@ -31,7 +31,8 @@ workspace "restic-backup" "C4 model of the @atalanta/restic-backup swamp model e
         methods -> secrets "redacts subprocess output"
         methods -> invoker "runs restic commands"
         methods -> policy "builds include/exclude"
-        methods -> pathsafety "checks restore targets"
+        methods -> pathsafety "resolves the safe restore target"
+        invoker -> pathsafety "restore accepts only SafeRestoreTarget (type)"
         methods -> schemas "validates args + result"
         preflight -> secrets "resolves (validate + brand)"
         preflight -> invoker "probes --json capability"

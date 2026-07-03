@@ -79,6 +79,10 @@ export const RestoreResultSchema = z.object({
   filesRestored: z.number(),
   bytesRestored: z.number(),
   message: z.string(),
+  // True when the restore was into a dangerous target allowed only by an explicit
+  // confirm override; false for a routine safe restore. Additive and defaulted so
+  // resources written before this field parse unchanged.
+  overridden: z.boolean().default(false),
 });
 
 export const ForgetResultSchema = z.object({

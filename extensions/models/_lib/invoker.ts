@@ -15,6 +15,7 @@
 
 import type { z } from "npm:zod@4.4.3";
 import type { ResolvedSecrets } from "./secrets.ts";
+import type { SafeRestoreTarget } from "./path-safety.ts";
 
 /** Structured result from running a restic subprocess. */
 export type ResticResult = {
@@ -95,13 +96,15 @@ async function spawnRestic(
 }
 
 /**
- * Invoke a restic command that requires repo access.
- * Secrets are injected ONLY via subprocess env (RESTIC_PASSWORD, B2_ACCOUNT_ID,
- * B2_ACCOUNT_KEY) — never as argv or in any logged output.
- * Accepts only a ResolvedSecrets, which can be produced solely by resolveSecrets
- * after validation — so this cannot be called with unvalidated secrets.
+ * Secret-injecting spawn — the single place secrets enter a restic subprocess
+ * env. Module-private: the only exported ways to reach it are invokeRestic
+ * (which refuses the `restore` command) and invokeResticRestore (which requires
+ * a branded SafeRestoreTarget). Keeping this unexported is what makes the
+ * branded restore path STRUCTURAL rather than conventional — a future caller
+ * cannot import a raw secret-injecting invoker and run a restore with an
+ * unchecked target.
  */
-export async function invokeRestic(
+function invokeResticInternal(
   argv: string[],
   secrets: ResolvedSecrets,
   cwd: string,
@@ -113,6 +116,74 @@ export async function invokeRestic(
   subprocessEnv["B2_ACCOUNT_ID"] = secrets.b2AccountId;
   subprocessEnv["B2_ACCOUNT_KEY"] = secrets.b2AccountKey;
   return spawnRestic(argv, subprocessEnv, cwd);
+}
+
+/**
+ * Invoke a restic command that requires repo access.
+ * Secrets are injected ONLY via subprocess env (RESTIC_PASSWORD, B2_ACCOUNT_ID,
+ * B2_ACCOUNT_KEY) — never as argv or in any logged output.
+ * Accepts only a ResolvedSecrets, which can be produced solely by resolveSecrets
+ * after validation — so this cannot be called with unvalidated secrets.
+ *
+ * REFUSES the `restore` command: restore must go through invokeResticRestore,
+ * whose SafeRestoreTarget parameter enforces the restore-safety guard. This
+ * closes the loophole where a caller could pass a raw --target here.
+ */
+export async function invokeRestic(
+  argv: string[],
+  secrets: ResolvedSecrets,
+  cwd: string,
+): Promise<ResticResult> {
+  // Contract: argv is [resticBinary, subcommand, ...args] — the subcommand is at
+  // argv[1] and global options (--repo, etc.) follow it. Every call in this
+  // extension is built that way. This fixed shape lets the restore guard be
+  // EXACT rather than parsing restic's open-ended global-flag surface (an
+  // allowlist of value-taking globals is impossible to keep complete and
+  // mis-parses either way — ARCH-3). A caller that puts global flags BEFORE the
+  // subcommand violates the contract and is rejected below.
+  if (argv[1] === "restore") {
+    throw new Error(
+      "invokeRestic must not run 'restore' — use invokeResticRestore with a SafeRestoreTarget so the restore-safety guard cannot be bypassed",
+    );
+  }
+  // Defence in depth: argv[1] must be a bare subcommand token, not a flag. If a
+  // caller placed a global flag before the subcommand, we cannot cheaply prove
+  // the subcommand isn't restore, so refuse rather than risk a bypass.
+  if (argv[1] !== undefined && argv[1].startsWith("-")) {
+    throw new Error(
+      "invokeRestic expects the subcommand at argv[1] (form: [restic, <subcommand>, ...flags]); global options before the subcommand are not supported",
+    );
+  }
+  return invokeResticInternal(argv, secrets, cwd);
+}
+
+/**
+ * Run a restic `restore`. This is the ONLY way to invoke a restore, and it is
+ * the sole reader of the target path — its parameter is a SafeRestoreTarget, so
+ * a restore cannot be launched with a raw, unchecked targetDir without a
+ * compile error. The target must have come from resolveRestoreTarget (in
+ * path-safety.ts), which enforces the restore-safety guard. Calls the private
+ * secret-injecting spawn directly (not invokeRestic, which refuses 'restore').
+ */
+export function invokeResticRestore(
+  safeTarget: SafeRestoreTarget,
+  snapshot: string,
+  repository: string,
+  secrets: ResolvedSecrets,
+  resticPath: string,
+  cwd: string,
+): Promise<ResticResult> {
+  const argv = [
+    resticPath,
+    "restore",
+    snapshot,
+    "--json",
+    "--repo",
+    repository,
+    "--target",
+    safeTarget.path,
+  ];
+  return invokeResticInternal(argv, secrets, cwd);
 }
 
 /**

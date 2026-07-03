@@ -5,10 +5,18 @@
  * invocation, no secrets. Importable by any module; imports nothing from
  * invoker.ts or secrets.ts.
  *
+ * POSIX-ONLY: this checker reasons about POSIX absolute paths (leading `/`,
+ * `/`-separated segments). A non-POSIX absolute target — a Windows drive-letter
+ * path such as `C:\Users\x` or `C:/Users/x` — cannot be judged correctly here
+ * and is refused by resolveRestoreTarget rather than silently misjudged.
+ *
  * Exports:
  *   - normalizePosixPath (pure string normalization)
  *   - resolvePathWithAncestor (symlink-safe path resolution for partially-existent paths)
  *   - checkRestoreTargetSafety (the main safety guard — exported for testing)
+ *   - isNonPosixAbsolute (drive-letter-absolute detector)
+ *   - resolveRestoreTarget (produces the branded SafeRestoreTarget)
+ *   - SafeRestoreTarget (branded, unforgeable checked-target type)
  *
  * SPDX-License-Identifier: Apache-2.0
  *
@@ -173,4 +181,73 @@ export async function checkRestoreTargetSafety(
   }
 
   return null;
+}
+
+// =============================================================================
+// Structural restore-target safety: branded SafeRestoreTarget + resolver
+// =============================================================================
+
+// Module-private brand. A real, unexported runtime Symbol (not a type-only
+// `declare const`, which emits no value). Because the symbol is never exported,
+// no other module can name this key — so a SafeRestoreTarget value can only be
+// constructed here, by resolveRestoreTarget, after the safety check has run.
+// The restic restore invocation accepts only a SafeRestoreTarget, so reaching
+// restic with an unchecked target is a compile-time impossibility.
+const SAFE_RESTORE_BRAND: unique symbol = Symbol("SafeRestoreTarget");
+
+/**
+ * A restore target that has passed the safety guard (or been explicitly
+ * overridden). Produced solely by resolveRestoreTarget. `overridden` records
+ * whether the target was dangerous and allowed only because the operator passed
+ * confirm — so a forced restore is distinguishable in the audit trail.
+ */
+export type SafeRestoreTarget = {
+  readonly path: string;
+  readonly overridden: boolean;
+  readonly [SAFE_RESTORE_BRAND]: true;
+};
+
+/**
+ * Detect a non-POSIX ABSOLUTE path: a Windows drive-letter absolute such as
+ * `C:\Users\x` or `C:/Users/x`. Scoped to the drive-letter form ONLY — a POSIX
+ * path that merely contains a backslash or colon elsewhere (`/tmp/a\b`, `a\b`,
+ * `a:b`) is a legitimate POSIX input and returns false.
+ */
+export function isNonPosixAbsolute(target: string): boolean {
+  return /^[A-Za-z]:[\\/]/.test(target);
+}
+
+/**
+ * Resolve a proposed restore target into a branded SafeRestoreTarget.
+ *
+ *   - non-POSIX absolute target  → throw (POSIX-only; cannot judge it)
+ *   - safe target                → { path, overridden: false }
+ *   - dangerous target + confirm → { path, overridden: true }  (explicit override)
+ *   - dangerous target, no confirm → throw the byte-identical dangerous-target refusal
+ *
+ * This is the ONLY producer of SafeRestoreTarget. The confirm flag feeds this
+ * resolver; it is no longer an enforcement-skipping boolean in the method body.
+ */
+export async function resolveRestoreTarget(
+  targetDir: string,
+  repoDir: string,
+  confirm: boolean,
+  cwdAnchor: string = Deno.cwd(),
+): Promise<SafeRestoreTarget> {
+  if (isNonPosixAbsolute(targetDir)) {
+    throw new Error(
+      `Restore refused (unsupported path): ${targetDir} looks like a non-POSIX absolute path; this extension supports POSIX paths only.`,
+    );
+  }
+
+  const msg = await checkRestoreTargetSafety(targetDir, repoDir, cwdAnchor);
+  if (msg === null) {
+    return { path: targetDir, overridden: false, [SAFE_RESTORE_BRAND]: true };
+  }
+  if (confirm) {
+    return { path: targetDir, overridden: true, [SAFE_RESTORE_BRAND]: true };
+  }
+  throw new Error(
+    `Restore refused (dangerous target): ${msg}. Set confirm:true to override.`,
+  );
 }
