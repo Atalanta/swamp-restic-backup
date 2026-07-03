@@ -3313,6 +3313,13 @@ Deno.test("ISSUE-4/S2: resolveSecrets returns a value redactSecrets accepts and 
   assertEquals(secrets.resticPassword, "PW_SECRET_VALUE");
   assertEquals(secrets.b2AccountId, "ID_SECRET_VALUE");
   assertEquals(secrets.b2AccountKey, "KEY_SECRET_VALUE");
+  // Assert the RUNTIME brand exists: resolveSecrets must attach a real symbol
+  // property (value true), not merely satisfy the type. A regression that
+  // returned a plain object cast `as ResolvedSecrets` would drop this and fail.
+  const brandSymbols = Object.getOwnPropertySymbols(secrets).filter(
+    (sym) => (secrets as unknown as Record<symbol, unknown>)[sym] === true,
+  );
+  assertEquals(brandSymbols.length, 1, "resolveSecrets must attach exactly one runtime brand symbol");
   // The branded value flows into redactSecrets with no cast, and all three
   // values are scrubbed — proving the ResolvedSecrets type is usable end to end.
   const redacted = redactSecrets(

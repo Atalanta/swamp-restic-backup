@@ -98,7 +98,8 @@ async function spawnRestic(
  * Invoke a restic command that requires repo access.
  * Secrets are injected ONLY via subprocess env (RESTIC_PASSWORD, B2_ACCOUNT_ID,
  * B2_ACCOUNT_KEY) — never as argv or in any logged output.
- * Must only be called AFTER validateSecrets returns null.
+ * Accepts only a ResolvedSecrets, which can be produced solely by resolveSecrets
+ * after validation — so this cannot be called with unvalidated secrets.
  */
 export async function invokeRestic(
   argv: string[],

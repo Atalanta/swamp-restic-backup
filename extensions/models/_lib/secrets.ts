@@ -2,9 +2,9 @@
  * Secret validation, extraction, and redaction for the restic backup model.
  *
  * This is the ONLY module that produces or handles resolved secret values.
- * The resolved secret values (resticPassword, b2AccountId, b2AccountKey) and
- * the ResticSecrets type are defined here; the invoker receives secrets as
- * plain function parameters.
+ * The branded ResolvedSecrets type and its sole producer, resolveSecrets, are
+ * defined here; the invoker receives a ResolvedSecrets (never a plain string
+ * triple), so a secret cannot reach restic without having passed validation.
  *
  * Does NOT perform subprocess invocation or filesystem IO.
  *
