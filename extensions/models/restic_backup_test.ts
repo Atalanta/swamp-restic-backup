@@ -3526,7 +3526,9 @@ Deno.test("ISSUE-5/ARCH-1: invokeRestic refuses a 'restore' argv (subcommand-fir
   );
   assertStringIncludes(err.message, "invokeRestic must not run 'restore'");
   assertStringIncludes(err.message, "invokeResticRestore");
-  // (b) ARCH-3: restore AFTER global options (--repo takes a value) — still refused.
+  // (b) ARCH-3: a global flag BEFORE the subcommand violates the argv[1]-is-
+  // subcommand contract and is refused — so `-r repo restore` / `--repo X restore`
+  // cannot slip a restore past the guard.
   const err2 = await assertRejects(
     () =>
       invokeRestic(
@@ -3536,7 +3538,17 @@ Deno.test("ISSUE-5/ARCH-1: invokeRestic refuses a 'restore' argv (subcommand-fir
       ),
     Error,
   );
-  assertStringIncludes(err2.message, "invokeRestic must not run 'restore'");
+  assertStringIncludes(err2.message, "expects the subcommand at argv[1]");
+  const err3 = await assertRejects(
+    () =>
+      invokeRestic(
+        ["/opt/homebrew/bin/restic", "-r", "b2:x:y", "restore", "latest", "--target", "/tmp/whatever"],
+        secrets,
+        "/tmp",
+      ),
+    Error,
+  );
+  assertStringIncludes(err3.message, "expects the subcommand at argv[1]");
   // (c) FALSE-POSITIVE guard: a backup whose --tag value is literally "restore"
   // is NOT a restore command and must NOT be refused (it fails later at spawn on
   // the fake path, but not with the restore-refusal message).
