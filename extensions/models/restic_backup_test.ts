@@ -401,7 +401,7 @@ for (const testCase of MISSING_SECRET_CASES) {
   });
 }
 
-Deno.test("S2: all three secrets present → no pre-restic error thrown (validation passes)", async () => {
+integrationTest("S2: all three secrets present → no pre-restic error thrown (validation passes)", async () => {
   // With all secrets present, validation should pass.
   // The actual restic call will fail (wrong repo URL / not a real B2), but
   // that's a restic-level error, not a secret-validation error.
@@ -1018,7 +1018,7 @@ Deno.test("S9/F2: restore refuses symlink-parent with missing child pointing int
   }
 });
 
-Deno.test("S9: restore with confirm:true over a safe staging dir → proceeds past safety check", async () => {
+integrationTest("S9: restore with confirm:true over a safe staging dir → proceeds past safety check", async () => {
   const { repoDir } = await makeRestoreTestDir();
   const stagingDir = await Deno.makeTempDir();
   try {
