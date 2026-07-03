@@ -12,8 +12,10 @@ workspace "restic-backup" "C4 model of the @atalanta/restic-backup swamp model e
         b2 = softwareSystem "Backblaze B2" "Object store holding the restic repository."
 
         ext = softwareSystem "@atalanta/restic-backup" "Swamp model extension: typed methods over restic to back up .swamp/ runtime evidence to B2." {
-            model = container "Model definition" "The @atalanta/restic-backup/repository model: the entry file restic_backup.ts plus six sibling modules under _lib/, with boundaries enforced by the import graph." {
-                methods = component "Entry (restic_backup.ts)" "8 method execute bodies, the MethodContext port, and composition of the _lib modules; re-exports the public helpers/constants."
+            model = container "Model definition" "The @atalanta/restic-backup/repository model: a thin registration shell (restic_backup.ts) plus modules under _lib/, with boundaries enforced by the import graph." {
+                entry = component "Entry (restic_backup.ts)" "Thin registration shell: imports, the public re-export block (four helpers/constants), model metadata, resources map, and model.methods wiring the eight method imports. No execute bodies inline."
+                methodmodules = component "_lib/methods/* (8 method modules)" "One focused module per method: check-restic.ts, init.ts, backup.ts, snapshots.ts, check.ts, restore.ts, forget.ts, prune.ts. Each exports { description, arguments, execute } verbatim and imports only the _lib concern modules it needs."
+                methodcontext = component "_lib/method-context.ts" "MethodContext type — the runtime port injected by swamp into every method execute. Internal _lib type; not re-exported."
                 schemas = component "_lib/schemas.ts" "arg + result Zod schemas and their inferred types."
                 secrets = component "_lib/secrets.ts" "resolveSecrets (sole producer of the branded, unforgeable ResolvedSecrets), redactSecrets — the type makes an unvalidated secret reaching restic unrepresentable."
                 invoker = component "_lib/invoker.ts" "invokeRestic, invokeResticNoSecrets, probeResticCapability, parse helpers, ResticResult — sole owner of Deno.Command (spawnRestic is module-private)."
@@ -27,18 +29,20 @@ workspace "restic-backup" "C4 model of the @atalanta/restic-backup swamp model e
         user -> swamp "runs method"
         swamp -> model "invokes execute(args, context)"
         vault -> secrets "supplies resolved secret strings via globalArgs"
-        methods -> preflight "runs the shared secret pre-flight"
-        methods -> secrets "redacts subprocess output"
-        methods -> invoker "runs restic commands"
-        methods -> policy "builds include/exclude"
-        methods -> pathsafety "resolves the safe restore target"
+        entry -> methodmodules "imports and wires"
+        methodmodules -> preflight "runs the shared secret pre-flight"
+        methodmodules -> secrets "redacts subprocess output"
+        methodmodules -> invoker "runs restic commands"
+        methodmodules -> policy "builds include/exclude"
+        methodmodules -> pathsafety "resolves the safe restore target"
+        methodmodules -> methodcontext "imports MethodContext type"
         invoker -> pathsafety "restore accepts only SafeRestoreTarget (type)"
-        methods -> schemas "validates args + result"
+        methodmodules -> schemas "validates args + result"
         preflight -> secrets "resolves (validate + brand)"
         preflight -> invoker "probes --json capability"
         invoker -> restic "spawns argv with --json, secrets in env"
         restic -> b2 "reads/writes repository"
-        methods -> datastore "writes result DataRecord"
+        methodmodules -> datastore "writes result DataRecord"
         tests -> model "exercises methods + helpers"
     }
 
