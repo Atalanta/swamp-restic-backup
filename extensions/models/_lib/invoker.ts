@@ -134,13 +134,59 @@ export async function invokeRestic(
   secrets: ResolvedSecrets,
   cwd: string,
 ): Promise<ResticResult> {
-  // argv[0] is the binary; argv[1] is the restic subcommand.
-  if (argv[1] === "restore") {
+  // Reject a restore in the SUBCOMMAND position. restic accepts global options
+  // (some with values, e.g. `--repo X`) before the subcommand, so `argv[1]`
+  // alone is not enough (ARCH-3). Find the first token that is the subcommand:
+  // skip the binary, skip flags (start with '-') and the value of any
+  // value-taking global flag, then check whether that token is "restore".
+  // This is precise — it does NOT reject a legitimate `restore` that appears as
+  // a flag VALUE (e.g. a backup `--tag restore` or `--host restore`).
+  if (resticSubcommand(argv) === "restore") {
     throw new Error(
       "invokeRestic must not run 'restore' — use invokeResticRestore with a SafeRestoreTarget so the restore-safety guard cannot be bypassed",
     );
   }
   return invokeResticInternal(argv, secrets, cwd);
+}
+
+// restic global flags (valid before the subcommand) that consume the NEXT argv
+// token as their value; used to locate the true subcommand token.
+const RESTIC_VALUE_GLOBAL_FLAGS = new Set([
+  "--repo",
+  "--repository-file",
+  "--password-file",
+  "--password-command",
+  "--cache-dir",
+  "--limit-download",
+  "--limit-upload",
+  "--option",
+  "-o",
+  "--host",
+  "--tls-client-cert",
+]);
+
+/**
+ * Return the restic subcommand token from an argv ([binary, ...args]), skipping
+ * leading global flags and their values. Returns null if none found. Used only
+ * to enforce that `restore` cannot run through invokeRestic.
+ */
+function resticSubcommand(argv: string[]): string | null {
+  let i = 1; // skip the binary
+  while (i < argv.length) {
+    const token = argv[i];
+    if (token.startsWith("-")) {
+      // A value-taking global flag consumes the next token; `--flag=value`
+      // forms carry their own value, so only skip a separate value token.
+      if (RESTIC_VALUE_GLOBAL_FLAGS.has(token) && !token.includes("=")) {
+        i += 2;
+      } else {
+        i += 1;
+      }
+      continue;
+    }
+    return token; // first non-flag token is the subcommand
+  }
+  return null;
 }
 
 /**

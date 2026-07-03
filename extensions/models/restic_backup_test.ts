@@ -3511,9 +3511,10 @@ Deno.test("ISSUE-5/S6: restore into .swamp/ with confirm:true proceeds and recor
 // path to a restore subprocess is invokeResticRestore (which requires a
 // SafeRestoreTarget). This closes the loophole where a future caller passes a
 // raw --target through the generic invoker.
-Deno.test("ISSUE-5/ARCH-1: invokeRestic refuses a 'restore' argv", async () => {
+Deno.test("ISSUE-5/ARCH-1: invokeRestic refuses a 'restore' argv (subcommand-first and after global options)", async () => {
   const globalArgs = makeGlobalArgs({ resticPassword: "pw", b2AccountId: "id", b2AccountKey: "key" });
   const secrets = resolveSecrets(globalArgs as GlobalArgs);
+  // (a) restore as the immediate subcommand.
   const err = await assertRejects(
     () =>
       invokeRestic(
@@ -3525,4 +3526,27 @@ Deno.test("ISSUE-5/ARCH-1: invokeRestic refuses a 'restore' argv", async () => {
   );
   assertStringIncludes(err.message, "invokeRestic must not run 'restore'");
   assertStringIncludes(err.message, "invokeResticRestore");
+  // (b) ARCH-3: restore AFTER global options (--repo takes a value) — still refused.
+  const err2 = await assertRejects(
+    () =>
+      invokeRestic(
+        ["/opt/homebrew/bin/restic", "--repo", "b2:x:y", "restore", "latest", "--target", "/tmp/whatever"],
+        secrets,
+        "/tmp",
+      ),
+    Error,
+  );
+  assertStringIncludes(err2.message, "invokeRestic must not run 'restore'");
+  // (c) FALSE-POSITIVE guard: a backup whose --tag value is literally "restore"
+  // is NOT a restore command and must NOT be refused (it fails later at spawn on
+  // the fake path, but not with the restore-refusal message).
+  const backupWithRestoreTag = invokeRestic(
+    ["/nonexistent/restic", "backup", "--tag", "restore", "/tmp/src"],
+    secrets,
+    "/tmp",
+  );
+  const backupResult = await backupWithRestoreTag;
+  // spawnRestic returns a structured failure (exit 127) for a missing binary
+  // rather than throwing — the point is it was NOT rejected as a restore.
+  assertEquals(backupResult.success, false);
 });
