@@ -62,6 +62,76 @@ import {
   ResticSnapshotArraySchema,
 } from "./_lib/schemas.ts";
 import { model } from "./restic_backup.ts";
+
+// ===========================================================================
+// ISSUE-8: restic-binary resolution for portable tests.
+//
+// Tests must not hardcode an install path. The real restic binary is resolved
+// from the RESTIC_BINARY env override if set, else from PATH via `command -v`.
+// Set RESTIC_BINARY to run the integration tests against a specific binary; if
+// restic is absent, the real-restic integration tests are SKIPPED (not failed,
+// not vacuously passed) via the integrationTest() wrapper below.
+// ===========================================================================
+function existsExecutable(path: string): boolean {
+  try {
+    return Deno.statSync(path).isFile;
+  } catch {
+    return false;
+  }
+}
+
+let _resticBinaryCache: string | null | undefined;
+function resolveRestic(): string | null {
+  if (_resticBinaryCache !== undefined) return _resticBinaryCache;
+  // RESTIC_BINARY override: honoured ONLY if it points at a real file, so
+  // RESTIC_BINARY=/nonexistent means "no restic" (skip integration tests), not
+  // "use this broken path" (which would run them and fail spuriously).
+  const override = Deno.env.get("RESTIC_BINARY");
+  if (override && override.trim() !== "") {
+    _resticBinaryCache = existsExecutable(override) ? override : null;
+    return _resticBinaryCache;
+  }
+  // Else resolve `restic` from PATH via `command -v`, then `which` as a fallback.
+  for (const [cmd, args] of [["command", ["-v", "restic"]], ["which", ["restic"]]] as const) {
+    try {
+      const out = new Deno.Command(cmd, { args: [...args], stdout: "piped", stderr: "null" }).outputSync();
+      if (out.success) {
+        const path = new TextDecoder().decode(out.stdout).trim();
+        if (path !== "" && existsExecutable(path)) {
+          _resticBinaryCache = path;
+          return _resticBinaryCache;
+        }
+      }
+    } catch { /* command/which not available — try next */ }
+  }
+  _resticBinaryCache = null;
+  return _resticBinaryCache;
+}
+
+/** The restic binary path for tests that invoke a real restic. Falls back to
+ * the literal "restic" (PATH-resolved at spawn) when no lookup succeeded, so a
+ * test that reaches here without a real binary fails loudly rather than using a
+ * stale hardcoded path. */
+function resticBinary(): string {
+  return resolveRestic() ?? "restic";
+}
+
+/** True iff a real restic binary is resolvable (RESTIC_BINARY or on PATH). */
+function hasRestic(): boolean {
+  return resolveRestic() !== null;
+}
+
+/** Register a test that invokes a REAL restic binary. It is skipped — with a
+ * reason visible in the ignored-test output — when restic is absent, so it
+ * never passes vacuously (binary never invoked) nor fails spuriously off a
+ * Homebrew machine. Do NOT use for fake-binary unit tests. */
+function integrationTest(name: string, fn: () => void | Promise<void>): void {
+  Deno.test({
+    name: `${name} [requires restic on PATH or RESTIC_BINARY]`,
+    ignore: !hasRestic(),
+    fn,
+  });
+}
 // Public-surface guard: the entry module must keep re-exporting the symbols it
 // exposed before the _lib/ split, so the refactor does not silently change the
 // extension's public API. Imported under a namespace so a dropped re-export is
@@ -161,7 +231,7 @@ function makeGlobalArgs(overrides: Record<string, unknown> = {}) {
     hostTag: undefined as string | undefined,
     extraTags: [] as string[],
     retention: {} as Record<string, number | undefined>,
-    resticPath: "/opt/homebrew/bin/restic",
+    resticPath: resticBinary(),
     // These are vault.get CEL expressions resolved by swamp at runtime.
     // In tests, swamp resolves them to plain string values before calling execute.
     resticPassword: "test-restic-password",
@@ -331,7 +401,7 @@ Deno.test("S2: all three secrets present → no pre-restic error thrown (validat
   // that's a restic-level error, not a secret-validation error.
   const { context } = makeContext({
     repository: "/tmp/nonexistent-restic-repo-validation-test",
-    resticPath: "/opt/homebrew/bin/restic",
+    resticPath: resticBinary(),
     resticPassword: "not-empty",
     b2AccountId: "not-empty",
     b2AccountKey: "not-empty",
@@ -537,7 +607,7 @@ async function runCommandAndGetStdout(methodName: keyof typeof model.methods, ar
   try {
     const { context } = makeContext({
       repository: `${tempDir}/nonexistent-repo`,
-      resticPath: "/opt/homebrew/bin/restic",
+      resticPath: resticBinary(),
       resticPassword: "probe-password",
       b2AccountId: "probe-id",
       b2AccountKey: "probe-key",
@@ -559,12 +629,12 @@ async function runCommandAndGetStdout(methodName: keyof typeof model.methods, ar
   }
 }
 
-Deno.test("S3: check_restic uses --json (version command returns JSON)", async () => {
+integrationTest("S3: check_restic uses --json (version command returns JSON)", async () => {
   const tempDir = await Deno.makeTempDir();
   try {
     const { context, writes } = makeContext({
       repository: "b2:test:test",
-      resticPath: "/opt/homebrew/bin/restic",
+      resticPath: resticBinary(),
       resticPassword: "probe",
       b2AccountId: "probe",
       b2AccountKey: "probe",
@@ -706,7 +776,7 @@ Deno.test("S3: capability probe with nonexistent binary → structured error, no
   }
 });
 
-Deno.test("S3: check_restic does NOT inject placeholder secrets when vault secrets are missing", async () => {
+integrationTest("S3: check_restic does NOT inject placeholder secrets when vault secrets are missing", async () => {
   // F1 fix: check_restic must work even when secret fields are empty/unset,
   // because it only probes the binary (restic version --json) which needs no creds.
   // Previously the code injected placeholder "probe" strings — that was wrong.
@@ -714,7 +784,7 @@ Deno.test("S3: check_restic does NOT inject placeholder secrets when vault secre
   try {
     const { context, writes } = makeContext({
       repository: "b2:test:test",
-      resticPath: "/opt/homebrew/bin/restic",
+      resticPath: resticBinary(),
       // Deliberately empty — check_restic must not validate or inject these.
       resticPassword: "",
       b2AccountId: "",
@@ -948,7 +1018,7 @@ Deno.test("S9: restore with confirm:true over a safe staging dir → proceeds pa
   try {
     const { context } = makeContext({
       repository: "/tmp/nonexistent-restic-for-restore-test",
-      resticPath: "/opt/homebrew/bin/restic",
+      resticPath: resticBinary(),
       resticPassword: "pass",
       b2AccountId: "id",
       b2AccountKey: "key",
@@ -1133,7 +1203,7 @@ Deno.test("R1: restore resolves relative repoDir correctly — absolute targetDi
 // boundary became '/.swamp' and an absolute target inside the actual repo's
 // .swamp/ would NOT be refused (function returns null). This test would FAIL
 // against that old behaviour; it passes only with the cwd-anchored fix.
-Deno.test("R1: repoDir='.' is anchored on the repo cwd, not '/' — DIFFERENTIAL proof of the bug", async () => {
+integrationTest("R1: repoDir='.' is anchored on the repo cwd, not '/' — DIFFERENTIAL proof of the bug", async () => {
   const repoRoot = await Deno.makeTempDir({ prefix: "swamp-r1-dot-" });
   const realRepoRoot = await Deno.realPath(repoRoot);
   const swampData = `${realRepoRoot}/.swamp/data`;
@@ -1243,7 +1313,7 @@ function makeIntegrationContext(
   return makeContext({
     repository: resticRepo,
     repoDir,
-    resticPath: "/opt/homebrew/bin/restic",
+    resticPath: resticBinary(),
     resticPassword: "integration-test-password",
     b2AccountId: "integration-b2-id",
     b2AccountKey: "integration-b2-key",
@@ -1252,7 +1322,7 @@ function makeIntegrationContext(
 }
 
 // S6: init
-Deno.test("S6: init — first call creates repository (created:true)", async () => {
+integrationTest("S6: init — first call creates repository (created:true)", async () => {
   const { repoDir, resticRepo, cleanup } = await makeIntegrationRepo();
   try {
     const { context, writes } = makeIntegrationContext(repoDir, resticRepo);
@@ -1268,7 +1338,7 @@ Deno.test("S6: init — first call creates repository (created:true)", async () 
   }
 });
 
-Deno.test("S6/F3: init — genuine open failure (wrong password) is NOT reported as already-initialized", async () => {
+integrationTest("S6/F3: init — genuine open failure (wrong password) is NOT reported as already-initialized", async () => {
   // F3 fix: previously the code classified errors by substring-matching error messages,
   // which could misreport auth/corruption failures as "already initialized".
   // Now we use `restic cat config` exit-code as the idempotency probe: if cat config
@@ -1307,7 +1377,7 @@ Deno.test("S6/F3: init — genuine open failure (wrong password) is NOT reported
   }
 });
 
-Deno.test("S6: init — second call on initialized repo (initialized:true, created:false, no throw)", async () => {
+integrationTest("S6: init — second call on initialized repo (initialized:true, created:false, no throw)", async () => {
   const { repoDir, resticRepo, cleanup } = await makeIntegrationRepo();
   try {
     const { context: ctx1 } = makeIntegrationContext(repoDir, resticRepo);
@@ -1325,7 +1395,7 @@ Deno.test("S6: init — second call on initialized repo (initialized:true, creat
 });
 
 // S7: backup
-Deno.test("S7: backup — fixture .swamp/ tree → snapshotId, non-zero file counts", async () => {
+integrationTest("S7: backup — fixture .swamp/ tree → snapshotId, non-zero file counts", async () => {
   const { repoDir, resticRepo, cleanup } = await makeIntegrationRepo();
   try {
     await makeFixtureSwampTree(repoDir);
@@ -1372,7 +1442,7 @@ Deno.test("S7: backup — fixture .swamp/ tree → snapshotId, non-zero file cou
   }
 });
 
-Deno.test("S7: backup — _catalog.db and bundle dirs NOT in snapshot (verify via restore)", async () => {
+integrationTest("S7: backup — _catalog.db and bundle dirs NOT in snapshot (verify via restore)", async () => {
   const { repoDir, resticRepo, cleanup } = await makeIntegrationRepo();
   try {
     await makeFixtureSwampTree(repoDir);
@@ -1433,7 +1503,7 @@ Deno.test("S7: backup — _catalog.db and bundle dirs NOT in snapshot (verify vi
 });
 
 // S5: snapshots
-Deno.test("S5: snapshots — lists snapshots from integration backup", async () => {
+integrationTest("S5: snapshots — lists snapshots from integration backup", async () => {
   const { repoDir, resticRepo, cleanup } = await makeIntegrationRepo();
   try {
     await makeFixtureSwampTree(repoDir);
@@ -1462,7 +1532,7 @@ Deno.test("S5: snapshots — lists snapshots from integration backup", async () 
 });
 
 // S8: check
-Deno.test("S8: check — after backup → ok:true, zero errors", async () => {
+integrationTest("S8: check — after backup → ok:true, zero errors", async () => {
   const { repoDir, resticRepo, cleanup } = await makeIntegrationRepo();
   try {
     await makeFixtureSwampTree(repoDir);
@@ -1486,7 +1556,7 @@ Deno.test("S8: check — after backup → ok:true, zero errors", async () => {
 });
 
 // S9: restore integration
-Deno.test("S9: restore — latest to clean staging dir → files present", async () => {
+integrationTest("S9: restore — latest to clean staging dir → files present", async () => {
   const { repoDir, resticRepo, cleanup } = await makeIntegrationRepo();
   const stagingDir = await Deno.makeTempDir({ prefix: "swamp-restore-test-" });
   try {
@@ -1520,7 +1590,7 @@ Deno.test("S9: restore — latest to clean staging dir → files present", async
 });
 
 // S10: forget
-Deno.test("S10: forget --dry-run → snapshotsRemoved=0, nothing actually removed", async () => {
+integrationTest("S10: forget --dry-run → snapshotsRemoved=0, nothing actually removed", async () => {
   const { repoDir, resticRepo, cleanup } = await makeIntegrationRepo();
   try {
     await makeFixtureSwampTree(repoDir);
@@ -1544,7 +1614,7 @@ Deno.test("S10: forget --dry-run → snapshotsRemoved=0, nothing actually remove
   }
 });
 
-Deno.test("S10: forget non-dry-run keeps expected snapshots and removes old ones", async () => {
+integrationTest("S10: forget non-dry-run keeps expected snapshots and removes old ones", async () => {
   const { repoDir, resticRepo, cleanup } = await makeIntegrationRepo();
   try {
     await makeFixtureSwampTree(repoDir);
@@ -1575,7 +1645,7 @@ Deno.test("S10: forget non-dry-run keeps expected snapshots and removes old ones
 });
 
 // S11: prune
-Deno.test("S11: prune — after orphaning forget → completes with parsed result", async () => {
+integrationTest("S11: prune — after orphaning forget → completes with parsed result", async () => {
   const { repoDir, resticRepo, cleanup } = await makeIntegrationRepo();
   try {
     await makeFixtureSwampTree(repoDir);
@@ -1617,7 +1687,7 @@ Deno.test("S11: prune — after orphaning forget → completes with parsed resul
 // S12: Secret-leakage canary integration test
 // =============================================================================
 
-Deno.test("S12: secret-leakage canary — no literal secret values in snapshot or restore", async () => {
+integrationTest("S12: secret-leakage canary — no literal secret values in snapshot or restore", async () => {
   const { repoDir, resticRepo, cleanup } = await makeIntegrationRepo();
   const stagingDir = await Deno.makeTempDir({ prefix: "swamp-canary-restore-" });
 
@@ -2865,6 +2935,70 @@ exit 1
   }
 });
 
+// ISSUE-8: check ok:false WITH POPULATED errors. ISSUE-3/S5 above asserts
+// ok:false on a num_errors>0 summary that emits NO message_type:error line, so
+// its errors array stays empty. This test drives a check that emits a real
+// message_type:error line and exits non-zero, and asserts errors is populated —
+// exercising check.ts's error-line collection, which S5 leaves untested.
+Deno.test("ISSUE-8: check — non-zero exit with error output yields ok:false and populated errors", async () => {
+  const errorLine = JSON.stringify({
+    message_type: "error",
+    message: "pack 5f3a1b is damaged: wrong content hash",
+  });
+  const summaryLine = JSON.stringify({
+    message_type: "summary",
+    num_errors: 1,
+    broken_packs: ["5f3a1b"],
+    suggest_repair_index: true,
+    suggest_prune: false,
+  });
+
+  const tmpDir = await Deno.makeTempDir({ prefix: "swamp-i8-check-errlines-" });
+  const callCountFile = `${tmpDir}/call-count`;
+  const fakeBinary = `${tmpDir}/fake-restic`;
+  await Deno.writeTextFile(
+    fakeBinary,
+    `#!/bin/sh
+COUNT=0
+if [ -f "${callCountFile}" ]; then COUNT=$(cat "${callCountFile}"); fi
+COUNT=$((COUNT + 1))
+printf '%s' "$COUNT" > "${callCountFile}"
+if [ "$COUNT" -eq 1 ]; then
+  echo '{"message_type":"version","version":"0.18.1","go_version":"go1.25","go_os":"darwin","go_arch":"arm64"}'
+  exit 0
+fi
+# check call: emit an error line AND a summary, then exit non-zero (integrity failure)
+echo '${errorLine}'
+echo '${summaryLine}'
+exit 1
+`,
+  );
+  await Deno.chmod(fakeBinary, 0o755);
+
+  try {
+    const { context, writes } = makeContext({
+      repository: `${tmpDir}/repo`,
+      repoDir: tmpDir,
+      resticPath: fakeBinary,
+      resticPassword: "pass",
+      b2AccountId: "id",
+      b2AccountKey: "key",
+    });
+
+    // Must NOT throw — a well-formed integrity failure is written as ok:false.
+    await model.methods.check.execute({}, context);
+
+    assertEquals(writes.length, 1, "Must write exactly one checkResult resource");
+    assertEquals(writes[0].specName, "checkResult");
+    assertEquals(writes[0].data.ok, false, "ok must be false on a non-zero check exit");
+    const errors = writes[0].data.errors as string[];
+    assertEquals(Array.isArray(errors) && errors.length >= 1, true, "errors must be populated from the message_type:error line");
+    assertStringIncludes(errors.join("\n"), "pack 5f3a1b is damaged", "the error message must be captured");
+  } finally {
+    await Deno.remove(tmpDir, { recursive: true });
+  }
+});
+
 // CORR-1 / ARCH-1: check that EXITS 0 but produces no valid check summary must
 // fail at the boundary before writeResource, not silently default to ok:true.
 // (exit 0 without a parseable summary is the exact silent-default this ticket removes.)
@@ -3118,8 +3252,8 @@ exit 0
 const REAL_B2_ENABLED = Deno.env.get("SWAMP_BACKUP_TEST_REAL_B2") === "true";
 
 Deno.test({
-  name: "REAL-B2: full cycle init/backup/check/restore/forget/prune (env-gated)",
-  ignore: !REAL_B2_ENABLED,
+  name: "REAL-B2: full cycle init/backup/check/restore/forget/prune (env-gated) [requires restic on PATH or RESTIC_BINARY]",
+  ignore: !REAL_B2_ENABLED || !hasRestic(),
   fn: async () => {
     const b2Repo = Deno.env.get("SWAMP_BACKUP_TEST_B2_REPO");
     const resticPassword = Deno.env.get("SWAMP_BACKUP_TEST_RESTIC_PASSWORD");
@@ -3139,7 +3273,7 @@ Deno.test({
 
       const realB2Args = {
         repository: b2Repo,
-        resticPath: "/opt/homebrew/bin/restic",
+        resticPath: resticBinary(),
         resticPassword,
         b2AccountId,
         b2AccountKey,
@@ -3496,7 +3630,7 @@ Deno.test("ISSUE-5/S3: resolveRestoreTarget refuses a non-POSIX absolute target 
 
 // S6: acceptance through the REAL entrypoint — an override proceeds AND is
 // recorded as overridden:true in the written restoreResult.
-Deno.test("ISSUE-5/S6: restore into .swamp/ with confirm:true proceeds and records overridden:true", async () => {
+integrationTest("ISSUE-5/S6: restore into .swamp/ with confirm:true proceeds and records overridden:true", async () => {
   const { repoDir, resticRepo, cleanup } = await makeIntegrationRepo();
   try {
     await makeFixtureSwampTree(repoDir);
@@ -4020,7 +4154,7 @@ Deno.test("ISSUE-6-12/S1: invokeResticBackup with fake SpawnEffect captures argv
   assertEquals(capturedClearEnv, false, "clearEnv must be false for invokeResticBackup");
 });
 
-Deno.test("ISSUE-6-12/S2: check.execute with fixed clock produces deterministic record name and checkedAt", async () => {
+integrationTest("ISSUE-6-12/S2: check.execute with fixed clock produces deterministic record name and checkedAt", async () => {
   const FIXED_DATE = new Date("2026-01-02T03:04:05Z");
   const effects: MethodEffects = { now: () => FIXED_DATE };
   const { repoDir, resticRepo, cleanup } = await makeIntegrationRepo();
@@ -4056,7 +4190,7 @@ Deno.test("ISSUE-6-12/S2: check.execute with fixed clock produces deterministic 
   }
 });
 
-Deno.test("ISSUE-6-12/S2: forget.execute with fixed clock produces deterministic record name", async () => {
+integrationTest("ISSUE-6-12/S2: forget.execute with fixed clock produces deterministic record name", async () => {
   const FIXED_DATE = new Date("2026-01-02T03:04:05Z");
   const effects: MethodEffects = { now: () => FIXED_DATE };
   const { repoDir, resticRepo, cleanup } = await makeIntegrationRepo();
@@ -4086,7 +4220,7 @@ Deno.test("ISSUE-6-12/S2: forget.execute with fixed clock produces deterministic
   }
 });
 
-Deno.test("ISSUE-6-12/S2: prune.execute with fixed clock produces deterministic record name", async () => {
+integrationTest("ISSUE-6-12/S2: prune.execute with fixed clock produces deterministic record name", async () => {
   const FIXED_DATE = new Date("2026-01-02T03:04:05Z");
   const effects: MethodEffects = { now: () => FIXED_DATE };
   const { repoDir, resticRepo, cleanup } = await makeIntegrationRepo();
@@ -4124,7 +4258,7 @@ Deno.test("ISSUE-6-12/S2: prune.execute with fixed clock produces deterministic 
   }
 });
 
-Deno.test("ISSUE-6-12/S2: restore.execute with fixed clock produces deterministic record name", async () => {
+integrationTest("ISSUE-6-12/S2: restore.execute with fixed clock produces deterministic record name", async () => {
   const FIXED_DATE = new Date("2026-01-02T03:04:05Z");
   const effects: MethodEffects = { now: () => FIXED_DATE };
   const { repoDir, resticRepo, cleanup } = await makeIntegrationRepo();
@@ -4160,7 +4294,7 @@ Deno.test("ISSUE-6-12/S2: restore.execute with fixed clock produces deterministi
   }
 });
 
-Deno.test("ISSUE-6-12/S3: restore.execute with pinned cwd anchors .swamp/ boundary correctly", async () => {
+integrationTest("ISSUE-6-12/S3: restore.execute with pinned cwd anchors .swamp/ boundary correctly", async () => {
   // The effects.cwd seam lets tests pin the working directory used by
   // resolveRestoreTarget, independently of Deno.cwd(). This test verifies:
   //   (a) a target outside pinnedCwd/.swamp/ is accepted (safe), and
