@@ -8,7 +8,7 @@
 
 import { z } from "npm:zod@4.4.3";
 import { CheckResticArgsSchema } from "../schemas.ts";
-import { probeResticCapability } from "../invoker.ts";
+import { probeResticCapability } from "../commands.ts";
 import type { MethodContext } from "../method-context.ts";
 
 export const checkRestic = {

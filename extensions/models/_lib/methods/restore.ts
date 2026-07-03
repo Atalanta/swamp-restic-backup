@@ -16,11 +16,13 @@
 
 import { z } from "npm:zod@4.4.3";
 import { RestoreArgsSchema, ResticRestoreSummarySchema } from "../schemas.ts";
-import { invokeResticRestore, decodeResticSummary } from "../invoker.ts";
+import { invokeResticRestore } from "../commands.ts";
+import { decodeResticSummary } from "../decode.ts";
 import { runSecretPreflight } from "../preflight.ts";
 import { resolveRestoreTarget } from "../path-safety.ts";
 import { redactSecrets } from "../secrets.ts";
 import type { MethodContext } from "../method-context.ts";
+import type { MethodEffects } from "../method-effects.ts";
 
 export const restore = {
   description:
@@ -29,7 +31,14 @@ export const restore = {
   execute: async (
     args: z.infer<typeof RestoreArgsSchema>,
     context: MethodContext,
+    effects: MethodEffects = {},
   ) => {
+    // Wall-clock injectable seam: production uses real Date, tests inject a fixed clock.
+    const now = effects.now ?? (() => new Date());
+    // cwdAnchor injectable seam: production uses Deno.cwd(), tests inject a fixed dir.
+    // Only used for resolveRestoreTarget's cwdAnchor parameter — the subprocess cwd
+    // comes from runSecretPreflight (repoDir) as before.
+    const getCwdAnchor = effects.cwd ?? (() => Deno.cwd());
     if (!args.targetDir || args.targetDir.trim() === "") {
       throw new Error(
         "targetDir is required for restore — specify an explicit directory to restore into",
@@ -43,10 +52,13 @@ export const restore = {
     // explicit confirm override; a dangerous target without confirm, or a
     // non-POSIX absolute target, throws here. confirm is now an input to the
     // resolver, not an enforcement-skipping boolean in this method body.
+    // Always pass an explicit cwdAnchor (from the injectable cwd seam) so
+    // resolveRestoreTarget never relies on its own Deno.cwd() default here.
     const safeTarget = await resolveRestoreTarget(
       args.targetDir,
       context.globalArgs.repoDir,
       args.confirm,
+      getCwdAnchor(),
     );
 
     const { secrets, cwd, resticPath, repository } = await runSecretPreflight(
@@ -109,7 +121,7 @@ export const restore = {
 
     const handle = await context.writeResource(
       "restoreResult",
-      `restore-${new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19)}`,
+      `restore-${now().toISOString().replace(/[:.]/g, "-").slice(0, 19)}`,
       restoreData as unknown as Record<string, unknown>,
     );
 

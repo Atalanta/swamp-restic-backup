@@ -8,7 +8,8 @@
 
 import { z } from "npm:zod@4.4.3";
 import { InitArgsSchema, ResticInitOutputSchema } from "../schemas.ts";
-import { invokeResticCatConfig, invokeResticInit, decodeResticOutput } from "../invoker.ts";
+import { invokeResticCatConfig, invokeResticInit } from "../commands.ts";
+import { decodeResticOutput } from "../decode.ts";
 import { runSecretPreflight } from "../preflight.ts";
 import { redactSecrets } from "../secrets.ts";
 import type { MethodContext } from "../method-context.ts";

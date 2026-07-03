@@ -8,10 +8,12 @@
 
 import { z } from "npm:zod@4.4.3";
 import { CheckArgsSchema, ResticCheckSummarySchema } from "../schemas.ts";
-import { invokeResticCheck, decodeResticCheckOutput } from "../invoker.ts";
+import { invokeResticCheck } from "../commands.ts";
+import { decodeResticCheckOutput } from "../decode.ts";
 import { runSecretPreflight } from "../preflight.ts";
 import { redactSecrets } from "../secrets.ts";
 import type { MethodContext } from "../method-context.ts";
+import type { MethodEffects } from "../method-effects.ts";
 
 export const check = {
   description: "Check the restic repository for integrity errors",
@@ -19,7 +21,11 @@ export const check = {
   execute: async (
     _args: z.infer<typeof CheckArgsSchema>,
     context: MethodContext,
+    effects: MethodEffects = {},
   ) => {
+    // Wall-clock injectable seam: production uses real Date, tests inject a fixed clock.
+    const now = effects.now ?? (() => new Date());
+
     const { secrets, cwd, resticPath, repository } = await runSecretPreflight(
       context.globalArgs,
     );
@@ -64,12 +70,12 @@ export const check = {
       ok,
       errors: errorLines,
       warnings: [],
-      checkedAt: new Date().toISOString(),
+      checkedAt: now().toISOString(),
     };
 
     const handle = await context.writeResource(
       "checkResult",
-      `check-${new Date().toISOString().slice(0, 10)}`,
+      `check-${now().toISOString().slice(0, 10)}`,
       checkData as unknown as Record<string, unknown>,
     );
 
