@@ -55,9 +55,11 @@ import graph.
 
 The original single `_lib/invoker.ts` has been split into three modules with
 distinct responsibilities, plus an effects seam:
-- `_lib/spawn.ts` — sole owner of `Deno.Command` and `Deno.env`; exports the
-  `SpawnEffect` injectable seam so tests can inject a fake spawn without
-  launching a real process.
+- `_lib/spawn.ts` — sole owner of `Deno.Command`; exports the `SpawnEffect`
+  injectable seam, `realSpawn` (the real Deno.Command-backed SpawnEffect, which
+  takes a fully-built env and injects no secrets), and the no-secret probe
+  (which reads only `PATH`). It does NOT assemble the secret env — that lives in
+  commands.ts.
 - `_lib/commands.ts` — typed per-command invoker entries; each accepts an
   optional `spawn: SpawnEffect` for test injection. No generic `argv: string[]`
   export.
@@ -119,7 +121,7 @@ tests to inject a fixed `now` or `cwd` for deterministic record name assertions.
 - Secrets (restic password + two B2 credentials) enter only as `vault.get`
   references resolved by swamp; the Secret layer keeps resolved values out of
   argv, result resources, logs, and the backup.
-- `commands.ts` exposes typed per-command entries (no generic `argv: string[]` export). Method modules pass typed inputs; the command entry assembles argv internally, always including `--json`. `spawn.ts` is the sole owner of `Deno.Command` and `Deno.env`.
+- `commands.ts` exposes typed per-command entries (no generic `argv: string[]` export). Method modules pass typed inputs; the command entry assembles argv internally, always including `--json`. commands.ts also owns the module-private secret-injecting `invokeResticInternal` (it reads `Deno.env` to build the credential env, then calls `realSpawn`). `spawn.ts` is the sole owner of `Deno.Command`; no module exports a secret-bearing raw-argv entry.
 - Restore path safety refuses targets at the repo root, `.swamp/`, an ancestor
   of `.swamp/`, or inside `.swamp/`. The guard is structural: `resolveRestoreTarget`
   produces a branded `SafeRestoreTarget` only for a safe target or an explicit

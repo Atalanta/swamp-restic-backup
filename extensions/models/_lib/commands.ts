@@ -2,8 +2,10 @@
  * Typed per-command restic invoker entries and capability probe.
  *
  * Each entry assembles the exact restic argv (matching the canonical flag order)
- * and delegates to invokeResticInternal from spawn.ts — the private
- * secret-injecting spawn. Method modules import from here so:
+ * and delegates to the MODULE-PRIVATE invokeResticInternal below — which builds
+ * the secret env (reads Deno.env) and calls realSpawn from spawn.ts (the sole
+ * Deno.Command owner, which injects no secrets itself). Method modules import
+ * from here so:
  *   - No method module can construct a raw argv for secret-bearing execution.
  *   - The type system statically enforces typed inputs (no string[] escape hatch).
  *   - Flag order is captured ONCE here, not scattered across method bodies.
