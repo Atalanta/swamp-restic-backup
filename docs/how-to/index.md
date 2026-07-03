@@ -13,6 +13,10 @@ staging directory.
 [How to customise what is backed up](customise-what-is-backed-up.md) adds extra
 include paths or exclude patterns on top of the defaults.
 
+[How to generate the restic encryption password](generate-the-encryption-password.md)
+creates a strong random `RESTIC_PASSWORD` and stores it in the vault, for a new
+repository (a setup-time step).
+
 [How to replace a credential](replace-a-credential.md) rotates a B2 key or
 changes the restic password through the vault.
 

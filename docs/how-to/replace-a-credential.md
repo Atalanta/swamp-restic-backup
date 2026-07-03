@@ -22,9 +22,10 @@ swamp data get my-backup current --json
 restic authenticated to B2 with the new credential.
 
 Changing `RESTIC_PASSWORD` is different. restic encrypts each repository with
-its password, so a new password does not open an existing repository. Use
-`swamp vault put swamp-backup RESTIC_PASSWORD` only for a new repository, or
-follow restic's own key-change procedure for an existing one.
+its password, so a new password does not open an existing repository. Set it
+only for a new repository — see
+[How to generate the restic encryption password](generate-the-encryption-password.md)
+— or follow restic's own key-change procedure for an existing one.
 
 For how secrets flow from the vault into restic, see
 [About how secrets flow through the vault](../explanation/about-secrets-and-the-vault.md).
