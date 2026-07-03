@@ -1,21 +1,23 @@
 /**
  * Restic subprocess spawn primitives.
  *
- * This is the SOLE owner of Deno.Command and Deno.env. No other module may
- * construct Deno.Command directly.
+ * This is the SOLE owner of Deno.Command. No other module may construct
+ * Deno.Command directly.
  *
  * Exports:
  *   - SpawnEffect — injectable seam for the spawn operation (real or fake)
- *   - invokeResticInternal — module-private secret-injecting spawn (exported
- *     for commands.ts; not for general consumption)
- *   - invokeResticNoSecrets — the no-secrets version probe
+ *   - realSpawn — the real Deno.Command-backed SpawnEffect. It takes a
+ *     FULLY-BUILT env and injects NO secrets itself, so exporting it does not
+ *     create a secret-bearing raw-argv escape hatch; secret-env assembly lives
+ *     in commands.ts (the command layer), which is the only place restore is
+ *     reachable — and only via the SafeRestoreTarget-checked invokeResticRestore.
+ *   - invokeResticNoSecrets — the no-secrets version probe (clearEnv + PATH only)
  *
  * SPDX-License-Identifier: Apache-2.0
  *
  * @module
  */
 
-import type { ResolvedSecrets } from "./secrets.ts";
 import type { ResticResult } from "./decode.ts";
 
 /**
@@ -36,11 +38,11 @@ export type SpawnEffect = (
 ) => Promise<ResticResult>;
 
 /**
- * Real Deno.Command-backed spawn. Module-private: the sole place Deno.Command
- * is constructed. Only reachable from invokeResticInternal and
- * invokeResticNoSecrets in this module.
+ * Real Deno.Command-backed spawn — the sole place Deno.Command is constructed.
+ * Takes a fully-built env and injects no secrets; commands.ts builds the
+ * secret env before calling this, and tests substitute a fake SpawnEffect.
  */
-const realSpawn: SpawnEffect = async (
+export const realSpawn: SpawnEffect = async (
   argv: string[],
   env: Record<string, string>,
   cwd: string,
@@ -88,33 +90,6 @@ const realSpawn: SpawnEffect = async (
     durationMs,
   };
 };
-
-/**
- * Secret-injecting spawn — the single place secrets enter a restic subprocess
- * env. Module-private: the only exported ways to reach it are the typed
- * per-command invoker entries (invokeResticCheck, invokeResticPrune, etc.) and
- * invokeResticRestore (which requires a branded SafeRestoreTarget). Keeping
- * this unexported from the module is what makes the restore path STRUCTURAL
- * rather than conventional — a future caller cannot import a raw
- * secret-injecting invoker and run a restore with an unchecked target
- * (ISSUE-11/ARCH-1).
- *
- * The optional `spawn` parameter enables test injection. Real callers omit it.
- */
-export function invokeResticInternal(
-  argv: string[],
-  secrets: ResolvedSecrets,
-  cwd: string,
-  spawn: SpawnEffect = realSpawn,
-): Promise<ResticResult> {
-  // Build subprocess env: inherit current env then inject secrets, overwriting
-  // any pre-existing RESTIC_PASSWORD/B2_* values to prevent ambient leakage.
-  const subprocessEnv: Record<string, string> = { ...Deno.env.toObject() };
-  subprocessEnv["RESTIC_PASSWORD"] = secrets.resticPassword;
-  subprocessEnv["B2_ACCOUNT_ID"] = secrets.b2AccountId;
-  subprocessEnv["B2_ACCOUNT_KEY"] = secrets.b2AccountKey;
-  return spawn(argv, subprocessEnv, cwd, /* clearEnv= */ false);
-}
 
 /**
  * Invoke a restic command that does NOT touch the repository (e.g. `restic version`).

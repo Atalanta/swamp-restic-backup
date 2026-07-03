@@ -22,7 +22,7 @@
 
 import type { ResolvedSecrets } from "./secrets.ts";
 import { assertSafeRestoreTarget, type SafeRestoreTarget } from "./path-safety.ts";
-import { invokeResticInternal, invokeResticNoSecrets, type SpawnEffect } from "./spawn.ts";
+import { realSpawn, invokeResticNoSecrets, type SpawnEffect } from "./spawn.ts";
 import type { ResticResult } from "./decode.ts";
 
 // invokeRestic (generic string[] argv + runtime restore guard) has been retired.
@@ -31,6 +31,28 @@ import type { ResticResult } from "./decode.ts";
 // invokeResticInit, invokeResticCatConfig). Restore is reachable only via
 // invokeResticRestore (SafeRestoreTarget). No generic secret-injecting argv:string[]
 // entry is exported — the type surface is the enforcement boundary (ISSUE-11/ARCH-1).
+
+// MODULE-PRIVATE secret-injecting spawn: the single place secrets enter a restic
+// subprocess env. NOT exported — a raw secret-bearing argv:string[] escape hatch
+// would let a future caller run `restore` without a SafeRestoreTarget, which is
+// exactly the #5/#11 boundary this keeps structural. The only ways to reach it
+// are the typed per-command entries below and invokeResticRestore. spawn.ts owns
+// Deno.Command via realSpawn (which takes a fully-built env and injects nothing);
+// this function builds the secret env and hands it to realSpawn.
+function invokeResticInternal(
+  argv: string[],
+  secrets: ResolvedSecrets,
+  cwd: string,
+  spawn: SpawnEffect = realSpawn,
+): Promise<ResticResult> {
+  // Inherit current env then inject secrets, overwriting any pre-existing
+  // RESTIC_PASSWORD/B2_* values to prevent ambient leakage.
+  const subprocessEnv: Record<string, string> = { ...Deno.env.toObject() };
+  subprocessEnv["RESTIC_PASSWORD"] = secrets.resticPassword;
+  subprocessEnv["B2_ACCOUNT_ID"] = secrets.b2AccountId;
+  subprocessEnv["B2_ACCOUNT_KEY"] = secrets.b2AccountKey;
+  return spawn(argv, subprocessEnv, cwd, /* clearEnv= */ false);
+}
 
 /**
  * Invoke `restic check --json --repo <repository>`.

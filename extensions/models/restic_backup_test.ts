@@ -3779,23 +3779,30 @@ Deno.test("ISSUE-5/ARCH-1 (RETARGETED ISSUE-11): invoker exports no generic argv
   // `argv: string[]` alongside a ResolvedSecrets param is the retired shape.
   // invokeResticNoSecrets is the only argv:string[] entry allowed (it injects NO
   // secrets — it is the no-repo version probe).
-  const invokerSource = await Deno.readTextFile(
-    new URL("./_lib/commands.ts", import.meta.url).pathname,
-  );
-  const exportedFnSignatures = invokerSource.match(
-    /export\s+(?:async\s+)?function\s+(\w+)\s*\(([^)]*)\)/gs,
-  ) ?? [];
-  for (const sig of exportedFnSignatures) {
-    const nameMatch = sig.match(/function\s+(\w+)/);
-    const name = nameMatch ? nameMatch[1] : "?";
-    if (name === "invokeResticNoSecrets") continue; // no-secret probe: allowed
-    const takesRawArgv = /\bargv\s*:\s*string\s*\[\s*\]/.test(sig);
-    const takesSecrets = /ResolvedSecrets/.test(sig);
-    assertEquals(
-      takesRawArgv && takesSecrets,
-      false,
-      `invoker exports '${name}' taking a raw argv:string[] + ResolvedSecrets — no secret-injecting generic argv entry is allowed (ISSUE-11/ARCH-1/CORR-2)`,
+  // Scan BOTH the command layer (commands.ts) AND the spawn layer (spawn.ts):
+  // neither may EXPORT a secret-injecting function taking a raw `argv: string[]`,
+  // regardless of name. The secret-injecting invokeResticInternal must be
+  // module-private in commands.ts; spawn.ts may export realSpawn (a SpawnEffect
+  // that takes a fully-built env and injects no secrets) and invokeResticNoSecrets
+  // (no-secret probe), but no ResolvedSecrets-bearing argv:string[] entry.
+  for (const modFile of ["commands.ts", "spawn.ts"]) {
+    const modSource = await Deno.readTextFile(
+      new URL(`./_lib/${modFile}`, import.meta.url).pathname,
     );
+    const exportedFns = modSource.match(
+      /export\s+(?:async\s+)?function\s+(\w+)\s*\(([^)]*)\)/gs,
+    ) ?? [];
+    for (const sig of exportedFns) {
+      const name = (sig.match(/function\s+(\w+)/) ?? [])[1] ?? "?";
+      if (name === "invokeResticNoSecrets") continue; // no-secret probe: allowed
+      const takesRawArgv = /\bargv\s*:\s*string\s*\[\s*\]/.test(sig);
+      const takesSecrets = /ResolvedSecrets/.test(sig);
+      assertEquals(
+        takesRawArgv && takesSecrets,
+        false,
+        `${modFile} exports '${name}' taking a raw argv:string[] + ResolvedSecrets — no secret-injecting generic argv entry is allowed (ISSUE-11/ARCH-1/CORR-2)`,
+      );
+    }
   }
 
   // (b) Each rewired method module's SOURCE must NOT import invokeRestic or
@@ -3829,6 +3836,11 @@ Deno.test("ISSUE-5/ARCH-1 (RETARGETED ISSUE-11): invoker exports no generic argv
       source.includes("invokeResticInternal"),
       false,
       `${methodFile}: must NOT import or call 'invokeResticInternal' — that is module-private (ISSUE-11/ARCH-1)`,
+    );
+    assertEquals(
+      source.includes("realSpawn"),
+      false,
+      `${methodFile}: must NOT import the raw realSpawn primitive — reach restic only via typed command entries (ISSUE-11/ARCH-1)`,
     );
 
     // Must not build a raw argv array for restic execution — the tell-tale sign
@@ -4167,13 +4179,16 @@ Deno.test("ISSUE-6-12/S3: restore.execute with pinned cwd anchors .swamp/ bounda
     const { context: backupCtx } = makeIntegrationContext(repoDir, resticRepo);
     await model.methods.backup.execute({ tags: [] }, backupCtx);
 
-    // Pin cwd to repoDir so repoDir-relative paths resolve to the known tempdir.
-    // repoDir already IS an absolute path from makeIntegrationRepo, so this is
-    // equivalent to production behaviour; the seam proves the plumbing works.
+    // CORR-1: prove the seam DRIVES the anchor. Use a RELATIVE repoDir (".")
+    // in globalArgs and pin effects.cwd to the real temp repo. resolveRestoreTarget
+    // then anchors ".swamp/" at effects.cwd()/repoDir, NOT the process cwd — so a
+    // relative target that resolves into the pinned repo's .swamp/ is refused, and
+    // a target elsewhere is accepted. If restore ignored effects.cwd and used
+    // Deno.cwd(), the relative-target boundary below would misfire.
     const effects: MethodEffects = { cwd: () => repoDir };
 
-    // (a) stagingDir is outside repoDir/.swamp/ — must succeed without error
-    const { context: safeCtx, writes } = makeIntegrationContext(repoDir, resticRepo);
+    // (a) an absolute staging dir outside the pinned repo — accepted
+    const { context: safeCtx, writes } = makeIntegrationContext(".", resticRepo, { });
     await model.methods.restore.execute(
       { snapshot: "latest", targetDir: stagingDir, confirm: false },
       safeCtx,
@@ -4182,18 +4197,20 @@ Deno.test("ISSUE-6-12/S3: restore.execute with pinned cwd anchors .swamp/ bounda
     assertEquals(writes.length, 1, "safe restore must produce exactly one write");
     assertEquals(writes[0].specName, "restoreResult");
 
-    // (b) a target inside repoDir/.swamp/ must be refused
+    // (b) a target inside the pinned repo's .swamp/ — refused. repoDir in
+    // globalArgs is "." so the ONLY way this resolves into the real .swamp/ is
+    // via the injected effects.cwd anchor.
     const dangerousTarget = `${repoDir}/.swamp/subdir`;
-    const { context: dangerCtx } = makeIntegrationContext(repoDir, resticRepo);
-    await assertRejects(
+    const { context: dangerCtx } = makeIntegrationContext(".", resticRepo, { });
+    const err = await assertRejects(
       () => model.methods.restore.execute(
         { snapshot: "latest", targetDir: dangerousTarget, confirm: false },
         dangerCtx,
         effects,
       ),
       Error,
-      undefined,
     );
+    assertStringIncludes(err.message, "Restore refused (dangerous target)");
   } finally {
     await cleanup();
     await Deno.remove(stagingDir, { recursive: true });
