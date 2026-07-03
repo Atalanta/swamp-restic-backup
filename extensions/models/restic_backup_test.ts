@@ -32,6 +32,7 @@ import {
 } from "./_lib/invoker.ts";
 import { runSecretPreflight } from "./_lib/preflight.ts";
 import {
+  type GlobalArgs,
   ResticBackupSummarySchema,
   ResticCheckSummarySchema,
   ResticForgetArraySchema,
@@ -3177,7 +3178,7 @@ exit 0
       b2AccountId: "id",
       b2AccountKey: "key",
     });
-    const pf = await runSecretPreflight(globalArgs as never);
+    const pf = await runSecretPreflight(globalArgs as GlobalArgs);
     assertEquals(pf.cwd, tmpDir);
     assertEquals(pf.resticPath, fakeBinary);
     assertEquals(pf.repository, "b2:bucket:path");
@@ -3194,7 +3195,7 @@ Deno.test("ISSUE-7/S1: runSecretPreflight throws the missing-secrets message on 
     resticPassword: "", // blank → validation fails
   });
   const err = await assertRejects(
-    () => runSecretPreflight(globalArgs as never),
+    () => runSecretPreflight(globalArgs as GlobalArgs),
     Error,
   );
   assertStringIncludes(err.message, "Secret validation failed before calling restic:");
@@ -3225,7 +3226,7 @@ exit 3
       b2AccountKey: "key",
     });
     const err = await assertRejects(
-      () => runSecretPreflight(globalArgs as never),
+      () => runSecretPreflight(globalArgs as GlobalArgs),
       Error,
     );
     assertStringIncludes(err.message, "restic does not support --json:");
