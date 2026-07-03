@@ -2541,6 +2541,27 @@ Deno.test("ISSUE-3/S2: decodeResticOutput — schema-drifted stdout fails with s
   assertEquals(threw, true, "decodeResticOutput must throw on shape-drifted stdout");
 });
 
+Deno.test("ISSUE-3/CORR-2: decodeResticOutput — JSONL framing drift (newline-delimited objects) fails at the boundary", () => {
+  // A whole-payload command must emit ONE JSON array/object. Two objects on
+  // separate lines is a framing drift; strict whole-value JSON.parse must reject
+  // it rather than a JSONL fallback silently accepting it as an array.
+  const jsonlDrift =
+    `{"id":"a","short_id":"a1","time":"2026-07-03T08:00:50Z","hostname":"h","paths":["/x"]}\n` +
+    `{"id":"b","short_id":"b1","time":"2026-07-03T08:00:51Z","hostname":"h","paths":["/x"]}`;
+  let threw = false;
+  try {
+    decodeResticOutput(jsonlDrift, ResticSnapshotArraySchema, "snapshots");
+  } catch (err) {
+    threw = true;
+    assertEquals(err instanceof Error, true);
+    assertStringIncludes((err as Error).message, "snapshots");
+    assertStringIncludes((err as Error).message, "did not match expected shape");
+    // Must not embed the raw drifted output.
+    assertEquals((err as Error).message.includes("short_id"), false, "Must not embed raw output");
+  }
+  assertEquals(threw, true, "decodeResticOutput must reject JSONL-framed whole-payload output");
+});
+
 Deno.test("ISSUE-3/S2: decodeResticSummary — no summary line fails with sanitized command-named error", () => {
   // Valid JSONL but no message_type=="summary" line → boundary failure.
   const noSummaryStdout = `{"message_type":"status","percent_done":0.5}\n{"message_type":"status","percent_done":1.0}`;

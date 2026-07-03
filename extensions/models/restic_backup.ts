@@ -50,9 +50,9 @@ import {
   validateSecrets,
 } from "./_lib/secrets.ts";
 import {
+  decodeResticCheckOutput,
   decodeResticOutput,
   decodeResticSummary,
-  findJsonlMessage,
   invokeRestic,
   parseResticJsonOutput,
   probeResticCapability,
@@ -501,12 +501,13 @@ export const model = {
           username: snap.username ?? "",
         }));
 
-        // Select latest by chronological time comparison — parse each timestamp
-        // to epoch millis once, then compare ordinally (NOT localeCompare, which
-        // is locale-sensitive). Date.parse handles restic's RFC3339 timestamps.
-        const timeMs = (iso: string): number => Date.parse(iso);
-        const sortedByTime = [...snapshots].sort((a, b) => timeMs(a.time) - timeMs(b.time));
-        const latest = sortedByTime[sortedByTime.length - 1];
+        // Select latest by chronological time comparison. Parse each timestamp to
+        // epoch millis ONCE up front (Date.parse handles restic's RFC3339 output),
+        // then sort on the precomputed value — NOT localeCompare, which is
+        // locale-sensitive, and not reparsing inside the comparator.
+        const withTimeMs = snapshots.map((snap) => ({ snap, timeMs: Date.parse(snap.time) }));
+        withTimeMs.sort((a, b) => a.timeMs - b.timeMs);
+        const latest = withTimeMs[withTimeMs.length - 1]?.snap;
 
         const snapshotsData = {
           snapshots,
@@ -565,59 +566,17 @@ export const model = {
           cwd,
         );
 
-        // check --json emits a summary JSONL line.
-        // exit 0 = ok, exit non-zero = errors found (a non-zero exit with a well-formed
-        // summary is a VALID integrity-failure result, NOT a shape mismatch).
-        // Only an unparseable or schema-mismatched check SUMMARY triggers the boundary
-        // failure. If no summary line is present (e.g. restic emits exit_error JSON
-        // instead), we treat it as ok:false without raising a boundary error.
-        //
-        // Decode strategy:
-        //   1. Find the last message_type=="summary" line with findJsonlMessage.
-        //      A bad JSONL line (unparseable) is a boundary failure.
-        //   2. If a summary line is found, validate it against the check schema.
-        //      A schema-mismatched summary is a boundary failure.
-        //   3. If no valid summary is found, the exit code decides:
-        //      - exit 0  → restic claims success but produced no parseable check
-        //        result: that is exactly the silent-default this ticket removes,
-        //        so it is a BOUNDARY FAILURE (fail before writeResource).
-        //      - non-zero → restic already failed the integrity check (e.g. it
-        //        emitted exit_error JSON, not a summary); a missing summary is the
-        //        expected failed state, recorded as ok:false — NOT a shape mismatch.
-        let checkSummary: { message_type: "summary"; num_errors: number } | null;
-        let rawSummary: Record<string, unknown> | null = null;
-        if (result.stdout.trim() !== "") {
-          // Use findJsonlMessage to locate the summary line; sanitized error on bad JSONL.
-          try {
-            rawSummary = findJsonlMessage(result.stdout, "summary");
-          } catch {
-            // Unparseable JSONL line in non-empty check output → boundary failure.
-            throw new Error(
-              "restic check: output did not match expected shape — invalid JSON",
-            );
-          }
-        }
-
-        if (rawSummary !== null) {
-          // A summary line exists — validate it against the schema.
-          const validation = ResticCheckSummarySchema.safeParse(rawSummary);
-          if (!validation.success) {
-            throw new Error(
-              "restic check: output did not match expected shape",
-            );
-          }
-          checkSummary = validation.data;
-        } else if (result.success) {
-          // exit 0 but no valid check summary — restic reported success without a
-          // parseable result. Fail at the boundary rather than defaulting to ok:true.
-          throw new Error(
-            "restic check: exit 0 but no valid check summary — output did not match expected shape",
-          );
-        } else {
-          // Non-zero exit with no summary: the check itself failed. Recorded as
-          // ok:false below; not a boundary failure.
-          checkSummary = null;
-        }
+        // check output is decoded by the invoker-owned, exit-code-aware boundary
+        // helper: a valid summary is returned; an exit-0-without-valid-summary is a
+        // boundary failure (throws); a non-zero exit with no summary returns null
+        // (the check itself failed — recorded as ok:false below, not a shape
+        // mismatch). A well-formed summary with num_errors>0 is a valid
+        // integrity-failure result, not a shape mismatch.
+        const checkSummary = decodeResticCheckOutput(
+          result.stdout,
+          result.success,
+          ResticCheckSummarySchema,
+        );
 
         const numErrors = checkSummary?.num_errors ?? 0;
         const ok = result.success && numErrors === 0;

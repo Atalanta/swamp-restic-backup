@@ -228,12 +228,17 @@ export function findJsonlMessage(
 /**
  * Decode and validate a whole-payload restic command output.
  *
- * Parses the entire stdout via parseResticJsonOutput then validates the result
- * against a supplied Zod schema. On parse failure OR schema mismatch, throws
- * ONE sanitized boundary error naming the command and mismatch class — no raw
- * restic output, no unobserved exit code.
+ * These commands (init, snapshots, forget) emit ONE complete JSON value on
+ * stdout — a single object or array — NOT the JSONL stream that backup/restore
+ * produce. So this parses with a strict whole-value JSON.parse rather than
+ * parseResticJsonOutput: the latter's JSONL fallback would silently accept
+ * newline-delimited objects as an array, letting a whole-JSON→JSONL framing
+ * drift pass validation instead of failing at the boundary. On parse failure OR
+ * schema mismatch, throws ONE sanitized boundary error naming the command and
+ * mismatch class — no raw restic output, no unobserved exit code.
  *
- * Used by: snapshots, check, forget, init.
+ * Used by: init, snapshots, forget. (check has its own exit-code-aware decoder
+ * below because its output is a JSONL summary among error lines.)
  */
 export function decodeResticOutput<T>(
   stdout: string,
@@ -242,7 +247,7 @@ export function decodeResticOutput<T>(
 ): T {
   let parsed: unknown;
   try {
-    parsed = parseResticJsonOutput(stdout);
+    parsed = JSON.parse(stdout.trim());
   } catch {
     throw new Error(
       `restic ${command}: output did not match expected shape — invalid JSON`,
@@ -256,6 +261,61 @@ export function decodeResticOutput<T>(
     );
   }
   return result.data;
+}
+
+/**
+ * Decode and validate restic check output, which is exit-code-aware.
+ *
+ * check emits a JSONL stream: a message_type=="summary" line among possible
+ * error/status lines. The exit code decides how a missing/invalid summary is
+ * treated:
+ *   - exit 0 (success=true) + a valid summary  → returns the validated summary.
+ *   - exit 0 + missing/schema-mismatched summary → BOUNDARY FAILURE (restic
+ *     claimed success but produced no parseable result — the silent-default this
+ *     ticket removes).
+ *   - non-zero exit + no valid summary → returns null: restic already failed the
+ *     integrity check (e.g. it emitted exit_error JSON, not a summary); the
+ *     caller records this as ok:false. This is the expected failed state, NOT a
+ *     shape mismatch.
+ * A bad JSONL line in non-empty output is always a boundary failure.
+ * Throws a sanitized boundary error — no raw restic output.
+ */
+export function decodeResticCheckOutput(
+  stdout: string,
+  success: boolean,
+  schema: z.ZodType<{ message_type: "summary"; num_errors: number }>,
+): { message_type: "summary"; num_errors: number } | null {
+  let rawSummary: Record<string, unknown> | null = null;
+  if (stdout.trim() !== "") {
+    try {
+      rawSummary = findJsonlMessage(stdout, "summary");
+    } catch {
+      throw new Error(
+        "restic check: output did not match expected shape — invalid JSON",
+      );
+    }
+  }
+
+  if (rawSummary !== null) {
+    const validation = schema.safeParse(rawSummary);
+    if (!validation.success) {
+      throw new Error(
+        "restic check: output did not match expected shape",
+      );
+    }
+    return validation.data;
+  }
+
+  if (success) {
+    // exit 0 but no valid check summary — fail at the boundary rather than
+    // defaulting to ok:true downstream.
+    throw new Error(
+      "restic check: exit 0 but no valid check summary — output did not match expected shape",
+    );
+  }
+
+  // Non-zero exit with no summary: the check itself failed; caller records ok:false.
+  return null;
 }
 
 /**
