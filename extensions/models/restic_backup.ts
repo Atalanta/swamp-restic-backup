@@ -43,13 +43,17 @@ import {
   SnapshotsArgsSchema,
   SnapshotsSchema,
 } from "./_lib/schemas.ts";
-import { checkRestoreTargetSafety } from "./_lib/path-safety.ts";
+import {
+  checkRestoreTargetSafety,
+  resolveRestoreTarget,
+} from "./_lib/path-safety.ts";
 import { redactSecrets } from "./_lib/secrets.ts";
 import {
   decodeResticCheckOutput,
   decodeResticOutput,
   decodeResticSummary,
   invokeRestic,
+  invokeResticRestore,
   parseResticJsonOutput,
   probeResticCapability,
 } from "./_lib/invoker.ts";
@@ -563,7 +567,7 @@ export const model = {
 
     restore: {
       description:
-        "Restore a snapshot to a target directory. Refuses to restore into repo root, .swamp/, or ancestor directories without explicit confirm:true",
+        "Restore a snapshot to a target directory. Refuses a dangerous target (repo root, .swamp/, an ancestor of .swamp/, or inside .swamp/) unless confirm:true explicitly overrides it; an override is recorded in the result. POSIX paths only.",
       arguments: RestoreArgsSchema,
       execute: async (
         args: z.infer<typeof RestoreArgsSchema>,
@@ -575,33 +579,31 @@ export const model = {
           );
         }
 
-        // Check restore safety BEFORE any secret validation or restic invocation
-        const safetyError = await checkRestoreTargetSafety(
+        // Resolve the restore target through the safety guard BEFORE any secret
+        // validation or restic invocation (preserving error precedence: a
+        // dangerous target is refused before secrets are touched). resolveRestoreTarget
+        // returns a branded SafeRestoreTarget only for a safe target or an
+        // explicit confirm override; a dangerous target without confirm, or a
+        // non-POSIX absolute target, throws here. confirm is now an input to the
+        // resolver, not an enforcement-skipping boolean in this method body.
+        const safeTarget = await resolveRestoreTarget(
           args.targetDir,
           context.globalArgs.repoDir,
+          args.confirm,
         );
-        if (safetyError !== null && !args.confirm) {
-          throw new Error(
-            `Restore refused (dangerous target): ${safetyError}. Set confirm:true to override.`,
-          );
-        }
 
         const { secrets, cwd, resticPath, repository } = await runSecretPreflight(
           context.globalArgs,
         );
 
-        const result = await invokeRestic(
-          [
-            resticPath,
-            "restore",
-            args.snapshot,
-            "--json",
-            "--repo",
-            repository,
-            "--target",
-            args.targetDir,
-          ],
+        // invokeResticRestore accepts only a SafeRestoreTarget — the restic
+        // restore subprocess cannot be reached with a raw, unchecked target.
+        const result = await invokeResticRestore(
+          safeTarget,
+          args.snapshot,
+          repository,
           secrets,
+          resticPath,
           cwd,
         );
 
@@ -642,6 +644,10 @@ export const model = {
           filesRestored,
           bytesRestored,
           message: `Restored snapshot ${args.snapshot} to ${args.targetDir}`,
+          // Records whether this restore was into a dangerous target allowed only
+          // by an explicit confirm override — so an audit can distinguish a forced
+          // restore from a routine one.
+          overridden: safeTarget.overridden,
         };
 
         const handle = await context.writeResource(
@@ -651,11 +657,12 @@ export const model = {
         );
 
         context.logger.info(
-          "restore: {files} files, {bytes} bytes restored to {target}",
+          "restore: {files} files, {bytes} bytes restored to {target} (overridden={overridden})",
           {
             files: filesRestored,
             bytes: bytesRestored,
             target: args.targetDir,
+            overridden: safeTarget.overridden,
           },
         );
 

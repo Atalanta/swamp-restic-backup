@@ -15,6 +15,7 @@
 
 import type { z } from "npm:zod@4.4.3";
 import type { ResolvedSecrets } from "./secrets.ts";
+import type { SafeRestoreTarget } from "./path-safety.ts";
 
 /** Structured result from running a restic subprocess. */
 export type ResticResult = {
@@ -113,6 +114,36 @@ export async function invokeRestic(
   subprocessEnv["B2_ACCOUNT_ID"] = secrets.b2AccountId;
   subprocessEnv["B2_ACCOUNT_KEY"] = secrets.b2AccountKey;
   return spawnRestic(argv, subprocessEnv, cwd);
+}
+
+/**
+ * Run a restic `restore`. This is the ONLY way to invoke a restore, and it is
+ * the sole reader of the target path — its parameter is a SafeRestoreTarget, so
+ * a restore cannot be launched with a raw, unchecked targetDir without a
+ * compile error. The target must have come from resolveRestoreTarget (in
+ * path-safety.ts), which enforces the restore-safety guard.
+ *
+ * Secrets are injected via subprocess env by delegating to invokeRestic.
+ */
+export function invokeResticRestore(
+  safeTarget: SafeRestoreTarget,
+  snapshot: string,
+  repository: string,
+  secrets: ResolvedSecrets,
+  resticPath: string,
+  cwd: string,
+): Promise<ResticResult> {
+  const argv = [
+    resticPath,
+    "restore",
+    snapshot,
+    "--json",
+    "--repo",
+    repository,
+    "--target",
+    safeTarget.path,
+  ];
+  return invokeRestic(argv, secrets, cwd);
 }
 
 /**

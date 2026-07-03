@@ -58,7 +58,7 @@ C4Component
         Component(preflight, "_lib/preflight.ts", "module", "runSecretPreflight — sole definition of the secret-bearing prologue (resolveSecrets → ResolvedSecrets, read args, probe --json) shared by the seven operational methods; composes secrets + invoker")
         Component(secrets, "_lib/secrets.ts", "module", "resolveSecrets (sole producer of the branded, unforgeable ResolvedSecrets), redactSecrets — a secret cannot reach restic without passing validation")
         Component(invoker, "_lib/invoker.ts", "module", "invokeRestic, invokeResticNoSecrets, probeResticCapability, parse helpers, ResticResult — sole owner of Deno.Command (spawnRestic is module-private)")
-        Component(pathsafety, "_lib/path-safety.ts", "module", "normalizePosixPath, resolvePathWithAncestor, checkRestoreTargetSafety")
+        Component(pathsafety, "_lib/path-safety.ts", "module", "normalizePosixPath, resolvePathWithAncestor, checkRestoreTargetSafety, resolveRestoreTarget — sole producer of the branded SafeRestoreTarget (POSIX-only); the restic restore call accepts only that value")
         Component(policy, "_lib/policy.ts", "module", "DEFAULT_INCLUDE_PATHS, DEFAULT_EXCLUDE_PATTERNS, buildIncludeExcludeLists — sole source of the backup policy")
         Component(schemas, "_lib/schemas.ts", "module", "arg + result Zod schemas and their inferred types")
     }
@@ -67,6 +67,7 @@ C4Component
     Rel(methods, secrets, "imports (redactSecrets)")
     Rel(methods, invoker, "imports")
     Rel(methods, pathsafety, "imports")
+    Rel(invoker, pathsafety, "imports SafeRestoreTarget (type)")
     Rel(methods, policy, "imports")
     Rel(methods, schemas, "imports")
     Rel(preflight, secrets, "imports")
@@ -85,5 +86,9 @@ does not use the pre-flight.
   argv, result resources, logs, and the backup.
 - The restic invoker builds an argv array (no shell), always passing `--json`.
 - Restore path safety refuses targets at the repo root, `.swamp/`, an ancestor
-  of `.swamp/`, or inside `.swamp/`, unless `confirm: true`.
+  of `.swamp/`, or inside `.swamp/`. The guard is structural: `resolveRestoreTarget`
+  produces a branded `SafeRestoreTarget` only for a safe target or an explicit
+  `confirm: true` override (recorded as `overridden` in the result), and the
+  restic restore call accepts only that value — so an unchecked target cannot
+  reach restic. Non-POSIX absolute targets are refused (POSIX-only).
 - `_catalog.db` and bundle caches are excluded from the backup set.

@@ -23,7 +23,11 @@ import {
   DEFAULT_EXCLUDE_PATTERNS,
   DEFAULT_INCLUDE_PATHS,
 } from "./_lib/policy.ts";
-import { checkRestoreTargetSafety } from "./_lib/path-safety.ts";
+import {
+  checkRestoreTargetSafety,
+  isNonPosixAbsolute,
+  resolveRestoreTarget,
+} from "./_lib/path-safety.ts";
 import {
   decodeResticOutput,
   decodeResticSummary,
@@ -1487,6 +1491,8 @@ Deno.test("S9: restore — latest to clean staging dir → files present", async
     assertEquals(writes.length, 1);
     assertEquals(writes[0].specName, "restoreResult");
     assertEquals((writes[0].data.filesRestored as number) >= 1, true, "Must restore at least 1 file");
+    // ISSUE-5: a routine safe restore is recorded as not overridden.
+    assertEquals(writes[0].data.overridden, false, "Safe restore must record overridden:false");
 
     // Verify a file is actually present
     const stat = await Deno.stat(`${stagingDir}/.swamp/data/run-001.json`);
@@ -3378,4 +3384,115 @@ Deno.test("ISSUE-4/S6: backup.execute rejects a blank secret before any spawn wi
     "Secret validation failed before calling restic: Secret 'resticPassword' is missing or empty — provide a vault.get expression that resolves to the restic encryption password",
   );
   assertEquals(writes.length, 0, "no resource written when the secret is invalid");
+});
+
+// ===========================================================================
+// ISSUE-5: structural restore-target safety (resolveRestoreTarget /
+// SafeRestoreTarget / isNonPosixAbsolute / invokeResticRestore)
+// ===========================================================================
+
+// S2: non-POSIX absolute detector — drive-letter-absolute only.
+Deno.test("ISSUE-5/S2: isNonPosixAbsolute detects drive-letter absolutes only", () => {
+  // Positive: Windows drive-letter absolutes.
+  assertEquals(isNonPosixAbsolute("C:\\Users\\x"), true);
+  assertEquals(isNonPosixAbsolute("C:/Users/x"), true);
+  assertEquals(isNonPosixAbsolute("d:\\temp"), true);
+  // Negative: legitimate POSIX inputs must NOT be rejected.
+  assertEquals(isNonPosixAbsolute("/tmp/x"), false);
+  assertEquals(isNonPosixAbsolute("staging/x"), false);
+  assertEquals(isNonPosixAbsolute("/tmp/a\\b"), false, "backslash inside a POSIX path is fine");
+  assertEquals(isNonPosixAbsolute("a\\b"), false);
+  assertEquals(isNonPosixAbsolute("a:b"), false, "colon not in drive-letter position is fine");
+});
+
+// S3: resolveRestoreTarget — safe, override, refusal, non-POSIX.
+Deno.test("ISSUE-5/S3: resolveRestoreTarget returns a safe branded target for a safe dir", async () => {
+  const { repoDir } = await makeRestoreTestDir();
+  const stagingDir = await Deno.makeTempDir({ prefix: "swamp-i5-safe-" });
+  try {
+    const safe = await resolveRestoreTarget(stagingDir, repoDir, false);
+    assertEquals(safe.path, stagingDir);
+    assertEquals(safe.overridden, false);
+    // Runtime brand present (a plain object cast would drop this).
+    const brand = Object.getOwnPropertySymbols(safe).filter(
+      (s) => (safe as unknown as Record<symbol, unknown>)[s] === true,
+    );
+    assertEquals(brand.length, 1, "SafeRestoreTarget must carry exactly one runtime brand symbol");
+  } finally {
+    await Deno.remove(repoDir, { recursive: true });
+    await Deno.remove(stagingDir, { recursive: true });
+  }
+});
+
+Deno.test("ISSUE-5/S3: resolveRestoreTarget marks a dangerous target overridden when confirmed", async () => {
+  const { repoDir, swampDir } = await makeRestoreTestDir();
+  try {
+    const overridden = await resolveRestoreTarget(swampDir, repoDir, true);
+    assertEquals(overridden.path, swampDir);
+    assertEquals(overridden.overridden, true, "dangerous target + confirm must be overridden:true");
+  } finally {
+    await Deno.remove(repoDir, { recursive: true });
+  }
+});
+
+Deno.test("ISSUE-5/S3: resolveRestoreTarget throws the byte-identical refusal for a dangerous target without confirm", async () => {
+  const { repoDir, swampDir } = await makeRestoreTestDir();
+  try {
+    const err = await assertRejects(
+      () => resolveRestoreTarget(swampDir, repoDir, false),
+      Error,
+    );
+    assertStringIncludes(err.message, "Restore refused (dangerous target):");
+    assertStringIncludes(err.message, "Set confirm:true to override.");
+  } finally {
+    await Deno.remove(repoDir, { recursive: true });
+  }
+});
+
+Deno.test("ISSUE-5/S3: resolveRestoreTarget refuses a non-POSIX absolute target with the POSIX-only message", async () => {
+  const { repoDir } = await makeRestoreTestDir();
+  try {
+    const err = await assertRejects(
+      () => resolveRestoreTarget("C:\\Users\\evil", repoDir, false),
+      Error,
+    );
+    assertStringIncludes(err.message, "Restore refused (unsupported path):");
+    assertStringIncludes(err.message, "POSIX paths only");
+    // Even with confirm, a non-POSIX absolute is refused (it can't be judged).
+    const err2 = await assertRejects(
+      () => resolveRestoreTarget("C:\\Users\\evil", repoDir, true),
+      Error,
+    );
+    assertStringIncludes(err2.message, "POSIX paths only");
+  } finally {
+    await Deno.remove(repoDir, { recursive: true });
+  }
+});
+
+// S6: acceptance through the REAL entrypoint — an override proceeds AND is
+// recorded as overridden:true in the written restoreResult.
+Deno.test("ISSUE-5/S6: restore into .swamp/ with confirm:true proceeds and records overridden:true", async () => {
+  const { repoDir, resticRepo, cleanup } = await makeIntegrationRepo();
+  try {
+    await makeFixtureSwampTree(repoDir);
+    const { context: initCtx } = makeIntegrationContext(repoDir, resticRepo);
+    await model.methods.init.execute({}, initCtx);
+    const { context: backupCtx } = makeIntegrationContext(repoDir, resticRepo);
+    await model.methods.backup.execute({ tags: [] }, backupCtx);
+
+    // Restore INTO .swamp/ (a dangerous target) with confirm:true — must proceed
+    // and record the override. Use a fresh staging subdir under .swamp to avoid
+    // clobbering the live tree while still exercising the dangerous-target path.
+    const dangerousTarget = `${repoDir}/.swamp/restore-here`;
+    const { context: restoreCtx, writes } = makeIntegrationContext(repoDir, resticRepo);
+    await model.methods.restore.execute(
+      { snapshot: "latest", targetDir: dangerousTarget, confirm: true },
+      restoreCtx,
+    );
+    assertEquals(writes.length, 1);
+    assertEquals(writes[0].specName, "restoreResult");
+    assertEquals(writes[0].data.overridden, true, "Overridden restore must record overridden:true");
+  } finally {
+    await cleanup();
+  }
 });
