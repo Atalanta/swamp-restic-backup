@@ -170,7 +170,7 @@ export function invokeResticPrune(
 /** Typed inputs for the snapshots command. */
 export type SnapshotsInputs = {
   host?: string;
-  tags: string[];
+  tags: readonly string[];
   path?: string;
 };
 
@@ -231,9 +231,9 @@ export function invokeResticForget(
 
 /** Typed inputs for the backup command. */
 export type BackupInputs = {
-  excludePatterns: string[];
-  tags: string[];
-  includePaths: string[];
+  excludePatterns: readonly string[];
+  tags: readonly string[];
+  includePaths: readonly string[];
 };
 
 /**
