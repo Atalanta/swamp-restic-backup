@@ -28,7 +28,7 @@ C4Context
 ```mermaid
 C4Container
     System_Boundary(ext, "@atalanta/restic-backup") {
-        Container(model, "Model definition", "Deno TS", "@atalanta/restic-backup/repository: schemas, 8 methods, result specs")
+        Container(model, "Model definition", "Deno TS", "@atalanta/restic-backup/repository: thin registration shell + _lib/ concern modules")
         Container(tests, "Test suite", "Deno test", "Unit + local-repo integration + secret-leak canaries")
     }
     System_Boundary(swamp, "swamp runtime") {
@@ -45,16 +45,20 @@ C4Container
 
 ## Components (Model definition)
 
-The "Model definition" container is the entry file
-`extensions/models/restic_backup.ts` (the manifest's model entry) plus six
-sibling modules under `extensions/models/_lib/`. The entry holds the eight
-method bodies and the `MethodContext` port; each other concern is its own module
-with boundaries enforced by the import graph.
+The "Model definition" container is a thin registration shell
+`extensions/models/restic_backup.ts` (the manifest's model entry) plus modules
+under `extensions/models/_lib/`. The entry imports the eight method definitions
+from `_lib/methods/*` and wires them into `model.methods`; it contains no
+`execute` bodies. Each method lives in its own focused module. All concern
+modules are shared only through imports — boundaries are enforced by the
+import graph.
 
 ```mermaid
 C4Component
     Container_Boundary(model, "Model definition") {
-        Component(methods, "Entry (restic_backup.ts)", "module", "8 method execute() bodies, MethodContext port, composition of the _lib modules")
+        Component(entry, "Entry (restic_backup.ts)", "module", "Thin registration shell: imports, public re-export block (four helpers/constants), model metadata, resources map, and model.methods wiring the eight method imports. No execute bodies.")
+        Component(methodmodules, "_lib/methods/* (8 modules)", "module", "One focused module per method: check-restic.ts, init.ts, backup.ts, snapshots.ts, check.ts, restore.ts, forget.ts, prune.ts. Each exports { description, arguments, execute } and imports only the _lib concern modules it needs.")
+        Component(methodcontext, "_lib/method-context.ts", "module", "MethodContext type — the runtime port injected by swamp into every method execute. Internal _lib type; not re-exported.")
         Component(preflight, "_lib/preflight.ts", "module", "runSecretPreflight — sole definition of the secret-bearing prologue (resolveSecrets → ResolvedSecrets, read args, probe --json) shared by the seven operational methods; composes secrets + invoker")
         Component(secrets, "_lib/secrets.ts", "module", "resolveSecrets (sole producer of the branded, unforgeable ResolvedSecrets), redactSecrets — a secret cannot reach restic without passing validation")
         Component(invoker, "_lib/invoker.ts", "module", "invokeRestic, invokeResticNoSecrets, probeResticCapability, parse helpers, ResticResult — sole owner of Deno.Command (spawnRestic is module-private)")
@@ -63,13 +67,15 @@ C4Component
         Component(schemas, "_lib/schemas.ts", "module", "arg + result Zod schemas and their inferred types")
     }
 
-    Rel(methods, preflight, "imports")
-    Rel(methods, secrets, "imports (redactSecrets)")
-    Rel(methods, invoker, "imports")
-    Rel(methods, pathsafety, "imports")
+    Rel(entry, methodmodules, "imports and wires")
+    Rel(methodmodules, methodcontext, "imports MethodContext type")
+    Rel(methodmodules, preflight, "imports")
+    Rel(methodmodules, secrets, "imports (redactSecrets)")
+    Rel(methodmodules, invoker, "imports")
+    Rel(methodmodules, pathsafety, "imports")
     Rel(invoker, pathsafety, "imports SafeRestoreTarget (type)")
-    Rel(methods, policy, "imports")
-    Rel(methods, schemas, "imports")
+    Rel(methodmodules, policy, "imports")
+    Rel(methodmodules, schemas, "imports")
     Rel(preflight, secrets, "imports")
     Rel(preflight, invoker, "imports")
 ```
