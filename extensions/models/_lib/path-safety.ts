@@ -208,6 +208,29 @@ export type SafeRestoreTarget = {
 };
 
 /**
+ * Runtime guard for the SafeRestoreTarget brand.
+ *
+ * The brand is a compile-time type that TypeScript erases at runtime, so a JS
+ * caller, a deep import, or a `as SafeRestoreTarget` cast could otherwise hand a
+ * forged `{ path, overridden }` to the restore subprocess boundary. Checking the
+ * private brand symbol here makes the guarantee hold at runtime too: only a value
+ * produced by resolveRestoreTarget (the sole place the symbol is attached) passes.
+ * Call this before using a SafeRestoreTarget to reach restic.
+ */
+export function assertSafeRestoreTarget(
+  target: SafeRestoreTarget,
+): void {
+  if (
+    typeof target !== "object" || target === null ||
+    (target as Record<symbol, unknown>)[SAFE_RESTORE_BRAND] !== true
+  ) {
+    throw new Error(
+      "restore target was not produced by resolveRestoreTarget — refusing to run restic restore with an unverified target",
+    );
+  }
+}
+
+/**
  * Detect a non-POSIX ABSOLUTE path: a Windows drive-letter absolute such as
  * `C:\Users\x` or `C:/Users/x`. Scoped to the drive-letter form ONLY — a POSIX
  * path that merely contains a backslash or colon elsewhere (`/tmp/a\b`, `a\b`,

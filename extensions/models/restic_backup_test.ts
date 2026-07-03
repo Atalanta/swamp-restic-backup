@@ -24,6 +24,7 @@ import {
   DEFAULT_INCLUDE_PATHS,
 } from "./_lib/policy.ts";
 import {
+  assertSafeRestoreTarget,
   checkRestoreTargetSafety,
   isNonPosixAbsolute,
   resolveRestoreTarget,
@@ -32,13 +33,14 @@ import {
   decodeResticOutput,
   decodeResticSummary,
   findJsonlMessage,
-  invokeResticCheck,
-  invokeResticPrune,
-  invokeResticSnapshots,
-  invokeResticForget,
   invokeResticBackup,
-  invokeResticInit,
   invokeResticCatConfig,
+  invokeResticCheck,
+  invokeResticForget,
+  invokeResticInit,
+  invokeResticPrune,
+  invokeResticRestore,
+  invokeResticSnapshots,
   parseResticJsonOutput,
 } from "./_lib/invoker.ts";
 // ISSUE-11/S7: import the invoker module as a namespace to assert its exported surface.
@@ -3766,6 +3768,31 @@ Deno.test("ISSUE-5/ARCH-1 (RETARGETED ISSUE-11): invoker exports no generic argv
     "invoker must NOT export 'invokeResticInternal' — it must remain module-private (ISSUE-11/ARCH-1)",
   );
 
+  // (a2) Stronger than a name check (CORR-2): the invoker SOURCE must not EXPORT
+  // any secret-injecting function that takes a raw `argv: string[]` — regardless
+  // of its name. Scan every exported function signature; a param list containing
+  // `argv: string[]` alongside a ResolvedSecrets param is the retired shape.
+  // invokeResticNoSecrets is the only argv:string[] entry allowed (it injects NO
+  // secrets — it is the no-repo version probe).
+  const invokerSource = await Deno.readTextFile(
+    new URL("./_lib/invoker.ts", import.meta.url).pathname,
+  );
+  const exportedFnSignatures = invokerSource.match(
+    /export\s+(?:async\s+)?function\s+(\w+)\s*\(([^)]*)\)/gs,
+  ) ?? [];
+  for (const sig of exportedFnSignatures) {
+    const nameMatch = sig.match(/function\s+(\w+)/);
+    const name = nameMatch ? nameMatch[1] : "?";
+    if (name === "invokeResticNoSecrets") continue; // no-secret probe: allowed
+    const takesRawArgv = /\bargv\s*:\s*string\s*\[\s*\]/.test(sig);
+    const takesSecrets = /ResolvedSecrets/.test(sig);
+    assertEquals(
+      takesRawArgv && takesSecrets,
+      false,
+      `invoker exports '${name}' taking a raw argv:string[] + ResolvedSecrets — no secret-injecting generic argv entry is allowed (ISSUE-11/ARCH-1/CORR-2)`,
+    );
+  }
+
   // (b) Each rewired method module's SOURCE must NOT import invokeRestic or
   // invokeResticInternal and must NOT construct a raw argv for execution.
   // We read each method file as text and assert the absence of these patterns.
@@ -3820,6 +3847,19 @@ Deno.test("ISSUE-5/ARCH-1 (RETARGETED ISSUE-11): invoker exports no generic argv
     true,
     "restore.ts must reach restic via invokeResticRestore (ISSUE-11/ARCH-1)",
   );
+  // CORR-2: not just imported — restore.ts must actually CALL invokeResticRestore(
+  // (an import without a call would pass the includes() check but not run it).
+  assertEquals(
+    /invokeResticRestore\s*\(/.test(restoreSource),
+    true,
+    "restore.ts must CALL invokeResticRestore(...) in execute, not merely import it (ISSUE-11/ARCH-1/CORR-2)",
+  );
+  // And it must not cast to SafeRestoreTarget to fabricate a target.
+  assertEquals(
+    /as\s+SafeRestoreTarget/.test(restoreSource),
+    false,
+    "restore.ts must NOT cast to SafeRestoreTarget — the value comes from resolveRestoreTarget (ISSUE-11/ARCH-1/CORR-2)",
+  );
   const restoreHasGenericInvokeRestic = /\binvokeRestic\b(?![A-Z])/.test(restoreSource);
   assertEquals(
     restoreHasGenericInvokeRestic,
@@ -3831,4 +3871,57 @@ Deno.test("ISSUE-5/ARCH-1 (RETARGETED ISSUE-11): invoker exports no generic argv
     false,
     "restore.ts must NOT call invokeResticInternal directly (ISSUE-11/ARCH-1)",
   );
+});
+
+// ===========================================================================
+// ISSUE-11/CORR-1: runtime brand enforcement at the restore boundary.
+// The SafeRestoreTarget type is erased at runtime; assertSafeRestoreTarget +
+// the check inside invokeResticRestore refuse a forged/cast target so the #5
+// guarantee holds even against a JS caller or `as SafeRestoreTarget` cast.
+// ===========================================================================
+
+Deno.test("ISSUE-11/CORR-1: assertSafeRestoreTarget accepts a resolveRestoreTarget result and refuses a forged object", async () => {
+  const { repoDir } = await makeRestoreTestDir();
+  const stagingDir = await Deno.makeTempDir({ prefix: "swamp-i11-brand-" });
+  try {
+    // Genuine branded value passes.
+    const real = await resolveRestoreTarget(stagingDir, repoDir, false);
+    assertSafeRestoreTarget(real); // must not throw
+
+    // Forged plain object (no runtime brand symbol) is refused.
+    const forged = { path: `${repoDir}/.swamp`, overridden: false } as unknown as Parameters<typeof assertSafeRestoreTarget>[0];
+    let threw = false;
+    try {
+      assertSafeRestoreTarget(forged);
+    } catch (err) {
+      threw = true;
+      assertStringIncludes((err as Error).message, "not produced by resolveRestoreTarget");
+    }
+    assertEquals(threw, true, "assertSafeRestoreTarget must refuse a forged target");
+  } finally {
+    await Deno.remove(repoDir, { recursive: true });
+    await Deno.remove(stagingDir, { recursive: true });
+  }
+});
+
+Deno.test("ISSUE-11/CORR-1: invokeResticRestore refuses a forged (non-branded) target before spawning restic", async () => {
+  const secrets = resolveSecrets(
+    makeGlobalArgs({ resticPassword: "pw", b2AccountId: "id", b2AccountKey: "key" }) as GlobalArgs,
+  );
+  // A forged target with a dangerous path — invokeResticRestore must refuse it
+  // before building argv / spawning (resticPath is nonexistent to prove no spawn).
+  const forged = { path: "/etc", overridden: false } as unknown as Parameters<typeof invokeResticRestore>[0];
+  // invokeResticRestore runs the brand check before its first await, so the
+  // refusal surfaces as a synchronous throw (not a rejected promise) — the point
+  // is it happens BEFORE any spawn. Capture either shape.
+  let message = "";
+  let refused = false;
+  try {
+    await invokeResticRestore(forged, "latest", "b2:x:y", secrets, "/nonexistent/restic", "/tmp");
+  } catch (err) {
+    refused = true;
+    message = (err as Error).message;
+  }
+  assertEquals(refused, true, "invokeResticRestore must refuse a forged target");
+  assertStringIncludes(message, "not produced by resolveRestoreTarget");
 });

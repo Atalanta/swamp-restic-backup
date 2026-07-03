@@ -15,7 +15,7 @@
 
 import type { z } from "npm:zod@4.4.3";
 import type { ResolvedSecrets } from "./secrets.ts";
-import type { SafeRestoreTarget } from "./path-safety.ts";
+import { assertSafeRestoreTarget, type SafeRestoreTarget } from "./path-safety.ts";
 
 /** Structured result from running a restic subprocess. */
 export type ResticResult = {
@@ -308,6 +308,10 @@ export function invokeResticRestore(
   resticPath: string,
   cwd: string,
 ): Promise<ResticResult> {
+  // Runtime brand check: the SafeRestoreTarget type is erased at runtime, so a
+  // forged/cast object could otherwise reach the restore subprocess. Refuse any
+  // target not produced by resolveRestoreTarget before building argv.
+  assertSafeRestoreTarget(safeTarget);
   const argv = [
     resticPath,
     "restore",
