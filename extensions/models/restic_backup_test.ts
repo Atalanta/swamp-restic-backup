@@ -32,6 +32,7 @@ import {
   decodeResticOutput,
   decodeResticSummary,
   findJsonlMessage,
+  invokeRestic,
   parseResticJsonOutput,
 } from "./_lib/invoker.ts";
 import { runSecretPreflight } from "./_lib/preflight.ts";
@@ -3442,8 +3443,14 @@ Deno.test("ISSUE-5/S3: resolveRestoreTarget throws the byte-identical refusal fo
       () => resolveRestoreTarget(swampDir, repoDir, false),
       Error,
     );
-    assertStringIncludes(err.message, "Restore refused (dangerous target):");
-    assertStringIncludes(err.message, "Set confirm:true to override.");
+    // Byte-identical assertion: the message wraps checkRestoreTargetSafety's
+    // .swamp/-refusal (which embeds the resolved target path) with the historic
+    // "Restore refused (dangerous target): ... Set confirm:true to override."
+    // prefix/suffix. Compute the exact expected string from the resolved path.
+    const resolvedSwamp = await Deno.realPath(swampDir);
+    const expected =
+      `Restore refused (dangerous target): Refusing to restore into .swamp/ directly (${resolvedSwamp}). Use a staging directory outside the repo.. Set confirm:true to override.`;
+    assertEquals(err.message, expected);
   } finally {
     await Deno.remove(repoDir, { recursive: true });
   }
@@ -3456,8 +3463,11 @@ Deno.test("ISSUE-5/S3: resolveRestoreTarget refuses a non-POSIX absolute target 
       () => resolveRestoreTarget("C:\\Users\\evil", repoDir, false),
       Error,
     );
-    assertStringIncludes(err.message, "Restore refused (unsupported path):");
-    assertStringIncludes(err.message, "POSIX paths only");
+    // Byte-identical: this message is fully static (embeds only the target).
+    assertEquals(
+      err.message,
+      "Restore refused (unsupported path): C:\\Users\\evil looks like a non-POSIX absolute path; this extension supports POSIX paths only.",
+    );
     // Even with confirm, a non-POSIX absolute is refused (it can't be judged).
     const err2 = await assertRejects(
       () => resolveRestoreTarget("C:\\Users\\evil", repoDir, true),
@@ -3495,4 +3505,24 @@ Deno.test("ISSUE-5/S6: restore into .swamp/ with confirm:true proceeds and recor
   } finally {
     await cleanup();
   }
+});
+
+// ARCH-1: invokeRestic must refuse the 'restore' command so the only structural
+// path to a restore subprocess is invokeResticRestore (which requires a
+// SafeRestoreTarget). This closes the loophole where a future caller passes a
+// raw --target through the generic invoker.
+Deno.test("ISSUE-5/ARCH-1: invokeRestic refuses a 'restore' argv", async () => {
+  const globalArgs = makeGlobalArgs({ resticPassword: "pw", b2AccountId: "id", b2AccountKey: "key" });
+  const secrets = resolveSecrets(globalArgs as GlobalArgs);
+  const err = await assertRejects(
+    () =>
+      invokeRestic(
+        ["/opt/homebrew/bin/restic", "restore", "latest", "--json", "--repo", "b2:x:y", "--target", "/tmp/whatever"],
+        secrets,
+        "/tmp",
+      ),
+    Error,
+  );
+  assertStringIncludes(err.message, "invokeRestic must not run 'restore'");
+  assertStringIncludes(err.message, "invokeResticRestore");
 });

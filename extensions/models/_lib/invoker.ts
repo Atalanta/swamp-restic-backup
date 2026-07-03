@@ -96,13 +96,15 @@ async function spawnRestic(
 }
 
 /**
- * Invoke a restic command that requires repo access.
- * Secrets are injected ONLY via subprocess env (RESTIC_PASSWORD, B2_ACCOUNT_ID,
- * B2_ACCOUNT_KEY) — never as argv or in any logged output.
- * Accepts only a ResolvedSecrets, which can be produced solely by resolveSecrets
- * after validation — so this cannot be called with unvalidated secrets.
+ * Secret-injecting spawn — the single place secrets enter a restic subprocess
+ * env. Module-private: the only exported ways to reach it are invokeRestic
+ * (which refuses the `restore` command) and invokeResticRestore (which requires
+ * a branded SafeRestoreTarget). Keeping this unexported is what makes the
+ * branded restore path STRUCTURAL rather than conventional — a future caller
+ * cannot import a raw secret-injecting invoker and run a restore with an
+ * unchecked target.
  */
-export async function invokeRestic(
+function invokeResticInternal(
   argv: string[],
   secrets: ResolvedSecrets,
   cwd: string,
@@ -117,13 +119,37 @@ export async function invokeRestic(
 }
 
 /**
+ * Invoke a restic command that requires repo access.
+ * Secrets are injected ONLY via subprocess env (RESTIC_PASSWORD, B2_ACCOUNT_ID,
+ * B2_ACCOUNT_KEY) — never as argv or in any logged output.
+ * Accepts only a ResolvedSecrets, which can be produced solely by resolveSecrets
+ * after validation — so this cannot be called with unvalidated secrets.
+ *
+ * REFUSES the `restore` command: restore must go through invokeResticRestore,
+ * whose SafeRestoreTarget parameter enforces the restore-safety guard. This
+ * closes the loophole where a caller could pass a raw --target here.
+ */
+export async function invokeRestic(
+  argv: string[],
+  secrets: ResolvedSecrets,
+  cwd: string,
+): Promise<ResticResult> {
+  // argv[0] is the binary; argv[1] is the restic subcommand.
+  if (argv[1] === "restore") {
+    throw new Error(
+      "invokeRestic must not run 'restore' — use invokeResticRestore with a SafeRestoreTarget so the restore-safety guard cannot be bypassed",
+    );
+  }
+  return invokeResticInternal(argv, secrets, cwd);
+}
+
+/**
  * Run a restic `restore`. This is the ONLY way to invoke a restore, and it is
  * the sole reader of the target path — its parameter is a SafeRestoreTarget, so
  * a restore cannot be launched with a raw, unchecked targetDir without a
  * compile error. The target must have come from resolveRestoreTarget (in
- * path-safety.ts), which enforces the restore-safety guard.
- *
- * Secrets are injected via subprocess env by delegating to invokeRestic.
+ * path-safety.ts), which enforces the restore-safety guard. Calls the private
+ * secret-injecting spawn directly (not invokeRestic, which refuses 'restore').
  */
 export function invokeResticRestore(
   safeTarget: SafeRestoreTarget,
@@ -143,7 +169,7 @@ export function invokeResticRestore(
     "--target",
     safeTarget.path,
   ];
-  return invokeRestic(argv, secrets, cwd);
+  return invokeResticInternal(argv, secrets, cwd);
 }
 
 /**
