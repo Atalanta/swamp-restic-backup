@@ -14,7 +14,7 @@
  */
 
 import type { z } from "npm:zod@4.4.3";
-import type { ResticSecrets } from "./secrets.ts";
+import type { ResolvedSecrets } from "./secrets.ts";
 
 /** Structured result from running a restic subprocess. */
 export type ResticResult = {
@@ -102,7 +102,7 @@ async function spawnRestic(
  */
 export async function invokeRestic(
   argv: string[],
-  secrets: ResticSecrets,
+  secrets: ResolvedSecrets,
   cwd: string,
 ): Promise<ResticResult> {
   // Build subprocess env: inherit current env then inject secrets, overwriting

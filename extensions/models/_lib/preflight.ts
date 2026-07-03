@@ -26,16 +26,15 @@
 import { z } from "npm:zod@4.4.3";
 import type { GlobalArgsSchema } from "./schemas.ts";
 import {
-  extractSecrets,
   redactSecrets,
-  type ResticSecrets,
-  validateSecrets,
+  type ResolvedSecrets,
+  resolveSecrets,
 } from "./secrets.ts";
 import { probeResticCapability } from "./invoker.ts";
 
 /** The resolved inputs every secret-bearing operational method needs. */
 export type SecretPreflight = {
-  secrets: ResticSecrets;
+  secrets: ResolvedSecrets;
   cwd: string;
   resticPath: string;
   repository: string;
@@ -56,14 +55,19 @@ export type SecretPreflight = {
 export async function runSecretPreflight(
   globalArgs: z.infer<typeof GlobalArgsSchema>,
 ): Promise<SecretPreflight> {
-  const secretError = validateSecrets(globalArgs);
-  if (secretError !== null) {
+  // resolveSecrets throws the bare per-secret message on a missing/empty secret;
+  // re-wrap it with the historic prefix so the thrown text is byte-identical to
+  // the previous validate → throw prologue.
+  let secrets: ResolvedSecrets;
+  try {
+    secrets = resolveSecrets(globalArgs);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
     throw new Error(
-      `Secret validation failed before calling restic: ${secretError}`,
+      `Secret validation failed before calling restic: ${message}`,
     );
   }
 
-  const secrets = extractSecrets(globalArgs);
   const cwd = globalArgs.repoDir;
   const resticPath = globalArgs.resticPath;
   const repository = globalArgs.repository;
