@@ -15,11 +15,11 @@ workspace "restic-backup" "C4 model of the @atalanta/restic-backup swamp model e
             model = container "Model definition" "The @atalanta/restic-backup/repository model: the entry file restic_backup.ts plus six sibling modules under _lib/, with boundaries enforced by the import graph." {
                 methods = component "Entry (restic_backup.ts)" "8 method execute bodies, the MethodContext port, and composition of the _lib modules; re-exports the public helpers/constants."
                 schemas = component "_lib/schemas.ts" "arg + result Zod schemas and their inferred types."
-                secrets = component "_lib/secrets.ts" "validateSecrets, extractSecrets, redactSecrets, ResticSecrets — sole producer of resolved secret values (a structural secret TYPE is deferred to a later ticket)."
+                secrets = component "_lib/secrets.ts" "resolveSecrets (sole producer of the branded, unforgeable ResolvedSecrets), redactSecrets — the type makes an unvalidated secret reaching restic unrepresentable."
                 invoker = component "_lib/invoker.ts" "invokeRestic, invokeResticNoSecrets, probeResticCapability, parse helpers, ResticResult — sole owner of Deno.Command (spawnRestic is module-private)."
                 pathsafety = component "_lib/path-safety.ts" "normalizePosixPath, resolvePathWithAncestor, checkRestoreTargetSafety — refuses dangerous restore targets."
                 policy = component "_lib/policy.ts" "DEFAULT_INCLUDE_PATHS, DEFAULT_EXCLUDE_PATTERNS, buildIncludeExcludeLists — sole source of the curated .swamp/ subset."
-                preflight = component "_lib/preflight.ts" "runSecretPreflight — sole definition of the secret-bearing prologue (validate → extract secrets → read cwd/resticPath/repository → probe --json) shared by the seven operational methods; composes secrets + invoker. checkRestic does not use it (no-secret probe)."
+                preflight = component "_lib/preflight.ts" "runSecretPreflight — sole definition of the secret-bearing prologue (resolveSecrets → ResolvedSecrets, read cwd/resticPath/repository, probe --json) shared by the seven operational methods; composes secrets + invoker. checkRestic does not use it (no-secret probe)."
             }
             tests = container "Test suite" "restic_backup_test.ts — unit + local-repo integration + secret-leak canaries."
         }
@@ -33,7 +33,7 @@ workspace "restic-backup" "C4 model of the @atalanta/restic-backup swamp model e
         methods -> policy "builds include/exclude"
         methods -> pathsafety "checks restore targets"
         methods -> schemas "validates args + result"
-        preflight -> secrets "validates + extracts"
+        preflight -> secrets "resolves (validate + brand)"
         preflight -> invoker "probes --json capability"
         invoker -> restic "spawns argv with --json, secrets in env"
         restic -> b2 "reads/writes repository"

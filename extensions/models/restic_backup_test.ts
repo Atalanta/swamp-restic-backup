@@ -31,6 +31,7 @@ import {
   parseResticJsonOutput,
 } from "./_lib/invoker.ts";
 import { runSecretPreflight } from "./_lib/preflight.ts";
+import { redactSecrets, resolveSecrets } from "./_lib/secrets.ts";
 import {
   type GlobalArgs,
   ResticBackupSummarySchema,
@@ -3295,4 +3296,86 @@ exit 2
   } finally {
     await Deno.remove(tmpDir, { recursive: true });
   }
+});
+
+// ===========================================================================
+// ISSUE-4: branded, validated secret type (resolveSecrets / ResolvedSecrets)
+// ===========================================================================
+
+// S2: unit tests on resolveSecrets.
+Deno.test("ISSUE-4/S2: resolveSecrets returns a value redactSecrets accepts and scrubs", () => {
+  const globalArgs = makeGlobalArgs({
+    resticPassword: "PW_SECRET_VALUE",
+    b2AccountId: "ID_SECRET_VALUE",
+    b2AccountKey: "KEY_SECRET_VALUE",
+  });
+  const secrets = resolveSecrets(globalArgs as GlobalArgs);
+  assertEquals(secrets.resticPassword, "PW_SECRET_VALUE");
+  assertEquals(secrets.b2AccountId, "ID_SECRET_VALUE");
+  assertEquals(secrets.b2AccountKey, "KEY_SECRET_VALUE");
+  // Assert the RUNTIME brand exists: resolveSecrets must attach a real symbol
+  // property (value true), not merely satisfy the type. A regression that
+  // returned a plain object cast `as ResolvedSecrets` would drop this and fail.
+  const brandSymbols = Object.getOwnPropertySymbols(secrets).filter(
+    (sym) => (secrets as unknown as Record<symbol, unknown>)[sym] === true,
+  );
+  assertEquals(brandSymbols.length, 1, "resolveSecrets must attach exactly one runtime brand symbol");
+  // The branded value flows into redactSecrets with no cast, and all three
+  // values are scrubbed — proving the ResolvedSecrets type is usable end to end.
+  const redacted = redactSecrets(
+    "pw=PW_SECRET_VALUE id=ID_SECRET_VALUE key=KEY_SECRET_VALUE",
+    secrets,
+  );
+  assertEquals(redacted, "pw=[REDACTED] id=[REDACTED] key=[REDACTED]");
+});
+
+Deno.test("ISSUE-4/S2: resolveSecrets throws the exact per-secret message for each blank secret", () => {
+  const cases: Array<{ override: Record<string, unknown>; expect: string }> = [
+    {
+      override: { resticPassword: "" },
+      expect:
+        "Secret 'resticPassword' is missing or empty — provide a vault.get expression that resolves to the restic encryption password",
+    },
+    {
+      override: { b2AccountId: "" },
+      expect:
+        "Secret 'b2AccountId' is missing or empty — provide a vault.get expression that resolves to the B2 account ID",
+    },
+    {
+      override: { b2AccountKey: "" },
+      expect:
+        "Secret 'b2AccountKey' is missing or empty — provide a vault.get expression that resolves to the B2 account key",
+    },
+  ];
+  for (const { override, expect } of cases) {
+    const globalArgs = makeGlobalArgs(override);
+    let threw = false;
+    try {
+      resolveSecrets(globalArgs as GlobalArgs);
+    } catch (err) {
+      threw = true;
+      assertEquals((err as Error).message, expect);
+    }
+    assertEquals(threw, true, `resolveSecrets must throw for ${JSON.stringify(override)}`);
+  }
+});
+
+// S6: acceptance proof through the REAL entrypoint — a missing secret still fails
+// before any restic spawn, with the byte-identical preflight-wrapped message.
+Deno.test("ISSUE-4/S6: backup.execute rejects a blank secret before any spawn with the byte-identical message", async () => {
+  const { context, writes } = makeContext({
+    resticPath: "/nonexistent/restic-should-not-run",
+    resticPassword: "",
+    b2AccountId: "id",
+    b2AccountKey: "key",
+  });
+  const err = await assertRejects(
+    () => model.methods.backup.execute({ tags: [] }, context),
+    Error,
+  );
+  assertEquals(
+    err.message,
+    "Secret validation failed before calling restic: Secret 'resticPassword' is missing or empty — provide a vault.get expression that resolves to the restic encryption password",
+  );
+  assertEquals(writes.length, 0, "no resource written when the secret is invalid");
 });

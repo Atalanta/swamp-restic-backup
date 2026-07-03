@@ -14,7 +14,7 @@
  */
 
 import type { z } from "npm:zod@4.4.3";
-import type { ResticSecrets } from "./secrets.ts";
+import type { ResolvedSecrets } from "./secrets.ts";
 
 /** Structured result from running a restic subprocess. */
 export type ResticResult = {
@@ -98,11 +98,12 @@ async function spawnRestic(
  * Invoke a restic command that requires repo access.
  * Secrets are injected ONLY via subprocess env (RESTIC_PASSWORD, B2_ACCOUNT_ID,
  * B2_ACCOUNT_KEY) — never as argv or in any logged output.
- * Must only be called AFTER validateSecrets returns null.
+ * Accepts only a ResolvedSecrets, which can be produced solely by resolveSecrets
+ * after validation — so this cannot be called with unvalidated secrets.
  */
 export async function invokeRestic(
   argv: string[],
-  secrets: ResticSecrets,
+  secrets: ResolvedSecrets,
   cwd: string,
 ): Promise<ResticResult> {
   // Build subprocess env: inherit current env then inject secrets, overwriting
