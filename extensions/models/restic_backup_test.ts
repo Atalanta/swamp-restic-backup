@@ -681,7 +681,7 @@ integrationTest("S3: check uses --json (exit_error JSON on nonexistent repo)", a
   assertEquals(isParseError, false, `check should use --json; got: ${result}`);
 });
 
-integrationTest("S3: restore requires targetDir (checked before restic invocation)", async () => {
+Deno.test("S3: restore requires targetDir (checked before restic invocation)", async () => {
   const result = await runCommandAndGetStdout("restore", {
     snapshot: "latest",
     targetDir: "",
@@ -1209,7 +1209,7 @@ Deno.test("R1: restore resolves relative repoDir correctly — absolute targetDi
 // boundary became '/.swamp' and an absolute target inside the actual repo's
 // .swamp/ would NOT be refused (function returns null). This test would FAIL
 // against that old behaviour; it passes only with the cwd-anchored fix.
-integrationTest("R1: repoDir='.' is anchored on the repo cwd, not '/' — DIFFERENTIAL proof of the bug", async () => {
+Deno.test("R1: repoDir='.' is anchored on the repo cwd, not '/' — DIFFERENTIAL proof of the bug", async () => {
   const repoRoot = await Deno.makeTempDir({ prefix: "swamp-r1-dot-" });
   const realRepoRoot = await Deno.realPath(repoRoot);
   const swampData = `${realRepoRoot}/.swamp/data`;
