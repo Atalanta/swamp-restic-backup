@@ -72,7 +72,7 @@ import { model } from "./restic_backup.ts";
 // restic is absent, the real-restic integration tests are SKIPPED (not failed,
 // not vacuously passed) via the integrationTest() wrapper below.
 // ===========================================================================
-function existsExecutable(path: string): boolean {
+function existsFile(path: string): boolean {
   try {
     return Deno.statSync(path).isFile;
   } catch {
@@ -88,21 +88,27 @@ function resolveRestic(): string | null {
   // "use this broken path" (which would run them and fail spuriously).
   const override = Deno.env.get("RESTIC_BINARY");
   if (override && override.trim() !== "") {
-    _resticBinaryCache = existsExecutable(override) ? override : null;
+    _resticBinaryCache = existsFile(override) ? override : null;
     return _resticBinaryCache;
   }
-  // Else resolve `restic` from PATH via `command -v`, then `which` as a fallback.
-  for (const [cmd, args] of [["command", ["-v", "restic"]], ["which", ["restic"]]] as const) {
+  // Else resolve `restic` from PATH. `command -v` is a shell BUILTIN (running
+  // Deno.Command("command", ...) directly would fail — there is no `command`
+  // executable), so invoke it through `sh -c`; fall back to the `which` binary.
+  const lookups: Array<[string, string[]]> = [
+    ["sh", ["-c", "command -v restic"]],
+    ["which", ["restic"]],
+  ];
+  for (const [cmd, args] of lookups) {
     try {
-      const out = new Deno.Command(cmd, { args: [...args], stdout: "piped", stderr: "null" }).outputSync();
+      const out = new Deno.Command(cmd, { args, stdout: "piped", stderr: "null" }).outputSync();
       if (out.success) {
         const path = new TextDecoder().decode(out.stdout).trim();
-        if (path !== "" && existsExecutable(path)) {
+        if (path !== "" && existsFile(path)) {
           _resticBinaryCache = path;
           return _resticBinaryCache;
         }
       }
-    } catch { /* command/which not available — try next */ }
+    } catch { /* shell/which not available — try next */ }
   }
   _resticBinaryCache = null;
   return _resticBinaryCache;
@@ -652,7 +658,7 @@ integrationTest("S3: check_restic uses --json (version command returns JSON)", a
   }
 });
 
-Deno.test("S3: init uses --json (exit_error JSON on nonexistent repo, not human text)", async () => {
+integrationTest("S3: init uses --json (exit_error JSON on nonexistent repo, not human text)", async () => {
   const result = await runCommandAndGetStdout("init", {});
   // The error message should reference the restic failure, not a parse error
   // If --json was NOT used, we'd get a parse error or garbage text
@@ -661,7 +667,7 @@ Deno.test("S3: init uses --json (exit_error JSON on nonexistent repo, not human 
   assertEquals(isParseError, false, `init should use --json; got: ${result}`);
 });
 
-Deno.test("S3: snapshots uses --json (returns JSON array, not human text)", async () => {
+integrationTest("S3: snapshots uses --json (returns JSON array, not human text)", async () => {
   const result = await runCommandAndGetStdout("snapshots", {});
   // With --json, restic returns exit_error JSON or an empty array — both valid JSON
   // Without --json, we'd get human text which would cause a parse error
@@ -669,13 +675,13 @@ Deno.test("S3: snapshots uses --json (returns JSON array, not human text)", asyn
   assertEquals(isParseError, false, `snapshots should use --json; got: ${result}`);
 });
 
-Deno.test("S3: check uses --json (exit_error JSON on nonexistent repo)", async () => {
+integrationTest("S3: check uses --json (exit_error JSON on nonexistent repo)", async () => {
   const result = await runCommandAndGetStdout("check", {});
   const isParseError = result.includes("not valid JSON") || result.includes("Unexpected token");
   assertEquals(isParseError, false, `check should use --json; got: ${result}`);
 });
 
-Deno.test("S3: restore requires targetDir (checked before restic invocation)", async () => {
+integrationTest("S3: restore requires targetDir (checked before restic invocation)", async () => {
   const result = await runCommandAndGetStdout("restore", {
     snapshot: "latest",
     targetDir: "",
@@ -685,13 +691,13 @@ Deno.test("S3: restore requires targetDir (checked before restic invocation)", a
   assertStringIncludes(result, "targetDir", "restore must require targetDir");
 });
 
-Deno.test("S3: forget uses --json (exit_error JSON on nonexistent repo)", async () => {
+integrationTest("S3: forget uses --json (exit_error JSON on nonexistent repo)", async () => {
   const result = await runCommandAndGetStdout("forget", { keepLast: 3 });
   const isParseError = result.includes("not valid JSON") || result.includes("Unexpected token");
   assertEquals(isParseError, false, `forget should use --json; got: ${result}`);
 });
 
-Deno.test("S3: prune uses --json flag (even though restic emits no JSON for prune)", async () => {
+integrationTest("S3: prune uses --json flag (even though restic emits no JSON for prune)", async () => {
   // restic prune emits no JSON in any released version (upstream gap); --json is
   // passed anyway (harmless, future-proof). Success is determined by exit code only.
   // The test verifies the method does NOT attempt to JSON-parse the stdout — if it
