@@ -15,9 +15,10 @@
  * probe-failure behaviour.
  *
  * Pure composition — this module owns no restic invocation of its own. It calls
- * probeResticCapability (in invoker.ts, the sole owner of Deno.Command) and the
- * secret helpers (in secrets.ts). It must not construct Deno.Command directly,
- * and secrets.ts / invoker.ts must never import this module (no cycle).
+ * probeResticCapability (in commands.ts; spawn.ts is the sole owner of
+ * Deno.Command) and the secret helpers (in secrets.ts). It must not construct
+ * Deno.Command directly, and spawn.ts / commands.ts / secrets.ts must never
+ * import this module (no cycle).
  *
  * SPDX-License-Identifier: Apache-2.0
  *
@@ -31,7 +32,7 @@ import {
   type ResolvedSecrets,
   resolveSecrets,
 } from "./secrets.ts";
-import { probeResticCapability } from "./invoker.ts";
+import { probeResticCapability } from "./commands.ts";
 
 /** The resolved inputs every secret-bearing operational method needs. */
 export type SecretPreflight = {

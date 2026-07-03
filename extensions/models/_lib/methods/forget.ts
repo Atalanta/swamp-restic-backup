@@ -8,10 +8,12 @@
 
 import { z } from "npm:zod@4.4.3";
 import { ForgetArgsSchema, ResticForgetArraySchema } from "../schemas.ts";
-import { invokeResticForget, decodeResticOutput } from "../invoker.ts";
+import { invokeResticForget } from "../commands.ts";
+import { decodeResticOutput } from "../decode.ts";
 import { runSecretPreflight } from "../preflight.ts";
 import { redactSecrets } from "../secrets.ts";
 import type { MethodContext } from "../method-context.ts";
+import type { MethodEffects } from "../method-effects.ts";
 
 export const forget = {
   description:
@@ -20,7 +22,10 @@ export const forget = {
   execute: async (
     args: z.infer<typeof ForgetArgsSchema>,
     context: MethodContext,
+    effects: MethodEffects = {},
   ) => {
+    // Wall-clock injectable seam: production uses real Date, tests inject a fixed clock.
+    const now = effects.now ?? (() => new Date());
     const { secrets, cwd, resticPath, repository } = await runSecretPreflight(
       context.globalArgs,
     );
@@ -78,7 +83,7 @@ export const forget = {
 
     const handle = await context.writeResource(
       "forgetResult",
-      `forget-${new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19)}`,
+      `forget-${now().toISOString().replace(/[:.]/g, "-").slice(0, 19)}`,
       forgetData as unknown as Record<string, unknown>,
     );
 

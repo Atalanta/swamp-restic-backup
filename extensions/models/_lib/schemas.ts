@@ -8,7 +8,7 @@
  *   - Per-method argument schemas
  *
  * Does NOT include:
- *   - ResticResult (owned by invoker.ts — not schema-derived)
+ *   - ResticResult (owned by _lib/decode.ts — not schema-derived)
  *   - ResolvedSecrets (owned by secrets.ts — not schema-derived)
  *   - MethodContext (owned by _lib/method-context.ts — runtime-injected port)
  *

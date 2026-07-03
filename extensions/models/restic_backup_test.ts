@@ -30,9 +30,6 @@ import {
   resolveRestoreTarget,
 } from "./_lib/path-safety.ts";
 import {
-  decodeResticOutput,
-  decodeResticSummary,
-  findJsonlMessage,
   invokeResticBackup,
   invokeResticCatConfig,
   invokeResticCheck,
@@ -41,10 +38,18 @@ import {
   invokeResticPrune,
   invokeResticRestore,
   invokeResticSnapshots,
+} from "./_lib/commands.ts";
+import type { SpawnEffect } from "./_lib/spawn.ts";
+import type { MethodEffects } from "./_lib/method-effects.ts";
+import {
+  decodeResticOutput,
+  decodeResticSummary,
+  findJsonlMessage,
   parseResticJsonOutput,
-} from "./_lib/invoker.ts";
-// ISSUE-11/S7: import the invoker module as a namespace to assert its exported surface.
-import * as invokerNs from "./_lib/invoker.ts";
+} from "./_lib/decode.ts";
+// ISSUE-11/S7: import the commands module as a namespace to assert its exported surface.
+// (commands.ts is the new home of the typed per-command entries, replacing invoker.ts.)
+import * as invokerNs from "./_lib/commands.ts";
 import { runSecretPreflight } from "./_lib/preflight.ts";
 import { redactSecrets, resolveSecrets } from "./_lib/secrets.ts";
 import {
@@ -3768,29 +3773,36 @@ Deno.test("ISSUE-5/ARCH-1 (RETARGETED ISSUE-11): invoker exports no generic argv
     "invoker must NOT export 'invokeResticInternal' — it must remain module-private (ISSUE-11/ARCH-1)",
   );
 
-  // (a2) Stronger than a name check (CORR-2): the invoker SOURCE must not EXPORT
+  // (a2) Stronger than a name check (CORR-2): the commands SOURCE must not EXPORT
   // any secret-injecting function that takes a raw `argv: string[]` — regardless
   // of its name. Scan every exported function signature; a param list containing
   // `argv: string[]` alongside a ResolvedSecrets param is the retired shape.
   // invokeResticNoSecrets is the only argv:string[] entry allowed (it injects NO
   // secrets — it is the no-repo version probe).
-  const invokerSource = await Deno.readTextFile(
-    new URL("./_lib/invoker.ts", import.meta.url).pathname,
-  );
-  const exportedFnSignatures = invokerSource.match(
-    /export\s+(?:async\s+)?function\s+(\w+)\s*\(([^)]*)\)/gs,
-  ) ?? [];
-  for (const sig of exportedFnSignatures) {
-    const nameMatch = sig.match(/function\s+(\w+)/);
-    const name = nameMatch ? nameMatch[1] : "?";
-    if (name === "invokeResticNoSecrets") continue; // no-secret probe: allowed
-    const takesRawArgv = /\bargv\s*:\s*string\s*\[\s*\]/.test(sig);
-    const takesSecrets = /ResolvedSecrets/.test(sig);
-    assertEquals(
-      takesRawArgv && takesSecrets,
-      false,
-      `invoker exports '${name}' taking a raw argv:string[] + ResolvedSecrets — no secret-injecting generic argv entry is allowed (ISSUE-11/ARCH-1/CORR-2)`,
+  // Scan BOTH the command layer (commands.ts) AND the spawn layer (spawn.ts):
+  // neither may EXPORT a secret-injecting function taking a raw `argv: string[]`,
+  // regardless of name. The secret-injecting invokeResticInternal must be
+  // module-private in commands.ts; spawn.ts may export realSpawn (a SpawnEffect
+  // that takes a fully-built env and injects no secrets) and invokeResticNoSecrets
+  // (no-secret probe), but no ResolvedSecrets-bearing argv:string[] entry.
+  for (const modFile of ["commands.ts", "spawn.ts"]) {
+    const modSource = await Deno.readTextFile(
+      new URL(`./_lib/${modFile}`, import.meta.url).pathname,
     );
+    const exportedFns = modSource.match(
+      /export\s+(?:async\s+)?function\s+(\w+)\s*\(([^)]*)\)/gs,
+    ) ?? [];
+    for (const sig of exportedFns) {
+      const name = (sig.match(/function\s+(\w+)/) ?? [])[1] ?? "?";
+      if (name === "invokeResticNoSecrets") continue; // no-secret probe: allowed
+      const takesRawArgv = /\bargv\s*:\s*string\s*\[\s*\]/.test(sig);
+      const takesSecrets = /ResolvedSecrets/.test(sig);
+      assertEquals(
+        takesRawArgv && takesSecrets,
+        false,
+        `${modFile} exports '${name}' taking a raw argv:string[] + ResolvedSecrets — no secret-injecting generic argv entry is allowed (ISSUE-11/ARCH-1/CORR-2)`,
+      );
+    }
   }
 
   // (b) Each rewired method module's SOURCE must NOT import invokeRestic or
@@ -3824,6 +3836,11 @@ Deno.test("ISSUE-5/ARCH-1 (RETARGETED ISSUE-11): invoker exports no generic argv
       source.includes("invokeResticInternal"),
       false,
       `${methodFile}: must NOT import or call 'invokeResticInternal' — that is module-private (ISSUE-11/ARCH-1)`,
+    );
+    assertEquals(
+      source.includes("realSpawn"),
+      false,
+      `${methodFile}: must NOT import the raw realSpawn primitive — reach restic only via typed command entries (ISSUE-11/ARCH-1)`,
     );
 
     // Must not build a raw argv array for restic execution — the tell-tale sign
@@ -3924,4 +3941,278 @@ Deno.test("ISSUE-11/CORR-1: invokeResticRestore refuses a forged (non-branded) t
   }
   assertEquals(refused, true, "invokeResticRestore must refuse a forged target");
   assertStringIncludes(message, "not produced by resolveRestoreTarget");
+});
+
+// =============================================================================
+// ISSUE-6-12: Effects injection tests
+//
+// S1 (SpawnEffect): a fake SpawnEffect injected through a typed entry captures
+//   argv/env without launching a real process.
+// S2 (MethodEffects.now): fixed-clock tests for check/forget/prune/restore execute.
+// S3 (MethodEffects.cwd): pinned-cwd restore-anchor test.
+// =============================================================================
+
+Deno.test("ISSUE-6-12/S1: invokeResticBackup with fake SpawnEffect captures argv+env without subprocess", async () => {
+  // Inject a fake SpawnEffect that captures its call arguments and returns
+  // a synthetic success result — no real process is spawned.
+  let capturedArgv: string[] | null = null;
+  let capturedEnv: Record<string, string> | null = null;
+  let capturedCwd: string | null = null;
+  let capturedClearEnv: boolean | null = null;
+
+  const fakeSpawn: SpawnEffect = async (argv, env, cwd, clearEnv) => {
+    capturedArgv = [...argv];
+    capturedEnv = { ...env };
+    capturedCwd = cwd;
+    capturedClearEnv = clearEnv;
+    return {
+      stdout: '{"message_type":"summary","snapshot_id":"fakesnap","files_new":0,"files_changed":0,"files_unmodified":0,"dirs_new":0,"dirs_changed":0,"dirs_unmodified":0,"data_added":0,"data_added_packed":0,"total_files_processed":0,"total_bytes_processed":0,"total_duration":0.1,"backup_start":"2026-01-02T03:04:05Z","backup_end":"2026-01-02T03:04:06Z"}',
+      stderr: "",
+      exitCode: 0,
+      success: true,
+      durationMs: 1,
+    };
+  };
+
+  const globalArgs = makeGlobalArgs({
+    resticPassword: "FAKE_PW",
+    b2AccountId: "FAKE_ID",
+    b2AccountKey: "FAKE_KEY",
+  });
+  const secrets = resolveSecrets(globalArgs as GlobalArgs);
+
+  await invokeResticBackup(
+    {
+      excludePatterns: [".swamp/bundles"],
+      tags: ["ci"],
+      includePaths: [".swamp/data"],
+    },
+    "b2:test-bucket:test-path",
+    secrets,
+    "/fake/restic",
+    "/fake/cwd",
+    fakeSpawn,
+  );
+
+  // argv: fake binary + subcommand + flags + paths in canonical order
+  assertEquals(capturedArgv, [
+    "/fake/restic",
+    "backup",
+    "--json",
+    "--repo",
+    "b2:test-bucket:test-path",
+    "--exclude",
+    ".swamp/bundles",
+    "--tag",
+    "ci",
+    ".swamp/data",
+  ], "invokeResticBackup must pass exact argv to SpawnEffect in canonical order");
+
+  // Secrets must be present in the env passed to spawn
+  assertEquals(capturedEnv?.["RESTIC_PASSWORD"], "FAKE_PW", "RESTIC_PASSWORD must be injected");
+  assertEquals(capturedEnv?.["B2_ACCOUNT_ID"], "FAKE_ID", "B2_ACCOUNT_ID must be injected");
+  assertEquals(capturedEnv?.["B2_ACCOUNT_KEY"], "FAKE_KEY", "B2_ACCOUNT_KEY must be injected");
+
+  // cwd must be passed through
+  assertEquals(capturedCwd, "/fake/cwd", "cwd must be passed to SpawnEffect");
+
+  // clearEnv must be false for secret-bearing calls
+  assertEquals(capturedClearEnv, false, "clearEnv must be false for invokeResticBackup");
+});
+
+Deno.test("ISSUE-6-12/S2: check.execute with fixed clock produces deterministic record name and checkedAt", async () => {
+  const FIXED_DATE = new Date("2026-01-02T03:04:05Z");
+  const effects: MethodEffects = { now: () => FIXED_DATE };
+  const { repoDir, resticRepo, cleanup } = await makeIntegrationRepo();
+  try {
+    await makeFixtureSwampTree(repoDir);
+    const { context: initCtx } = makeIntegrationContext(repoDir, resticRepo);
+    await model.methods.init.execute({}, initCtx);
+
+    const { context: backupCtx } = makeIntegrationContext(repoDir, resticRepo);
+    await model.methods.backup.execute({ tags: [] }, backupCtx);
+
+    const { context, writes } = makeIntegrationContext(repoDir, resticRepo);
+    // Pass the fixed-clock effects as third arg; swamp runtime never passes it
+    await model.methods.check.execute({}, context, effects);
+
+    assertEquals(writes.length, 1);
+    assertEquals(writes[0].specName, "checkResult");
+
+    // checkedAt must be the fixed date ISO string, not the real wall clock
+    assertEquals(
+      writes[0].data.checkedAt,
+      FIXED_DATE.toISOString(),
+      "checkedAt must be the fixed-clock date",
+    );
+    // record name must use the fixed date's date portion: check-2026-01-02
+    assertEquals(
+      writes[0].instanceName,
+      "check-2026-01-02",
+      "record name must use fixed-clock date: check-2026-01-02",
+    );
+  } finally {
+    await cleanup();
+  }
+});
+
+Deno.test("ISSUE-6-12/S2: forget.execute with fixed clock produces deterministic record name", async () => {
+  const FIXED_DATE = new Date("2026-01-02T03:04:05Z");
+  const effects: MethodEffects = { now: () => FIXED_DATE };
+  const { repoDir, resticRepo, cleanup } = await makeIntegrationRepo();
+  try {
+    await makeFixtureSwampTree(repoDir);
+    const { context: initCtx } = makeIntegrationContext(repoDir, resticRepo);
+    await model.methods.init.execute({}, initCtx);
+
+    const { context: backupCtx } = makeIntegrationContext(repoDir, resticRepo);
+    await model.methods.backup.execute({ tags: [] }, backupCtx);
+
+    const { context, writes } = makeIntegrationContext(repoDir, resticRepo);
+    await model.methods.forget.execute({ keepLast: 1, dryRun: false }, context, effects);
+
+    assertEquals(writes.length, 1);
+    assertEquals(writes[0].specName, "forgetResult");
+
+    // record name: forget-2026-01-02T03-04-05 (ISO with : and . replaced by -, first 19 chars)
+    const expectedName = `forget-${FIXED_DATE.toISOString().replace(/[:.]/g, "-").slice(0, 19)}`;
+    assertEquals(
+      writes[0].instanceName,
+      expectedName,
+      `record name must use fixed-clock date: ${expectedName}`,
+    );
+  } finally {
+    await cleanup();
+  }
+});
+
+Deno.test("ISSUE-6-12/S2: prune.execute with fixed clock produces deterministic record name", async () => {
+  const FIXED_DATE = new Date("2026-01-02T03:04:05Z");
+  const effects: MethodEffects = { now: () => FIXED_DATE };
+  const { repoDir, resticRepo, cleanup } = await makeIntegrationRepo();
+  try {
+    await makeFixtureSwampTree(repoDir);
+    const { context: initCtx } = makeIntegrationContext(repoDir, resticRepo);
+    await model.methods.init.execute({}, initCtx);
+
+    // Create 2 backups so forget (keepLast:1) removes one, leaving packs for prune.
+    const { context: b1 } = makeIntegrationContext(repoDir, resticRepo);
+    await model.methods.backup.execute({ tags: [] }, b1);
+    await Deno.writeTextFile(`${repoDir}/.swamp/data/extra.json`, '{"x":1}');
+    const { context: b2 } = makeIntegrationContext(repoDir, resticRepo);
+    await model.methods.backup.execute({ tags: [] }, b2);
+
+    // forget keepLast:1 removes the older snapshot
+    const { context: forgetCtx } = makeIntegrationContext(repoDir, resticRepo);
+    await model.methods.forget.execute({ keepLast: 1, dryRun: false }, forgetCtx);
+
+    const { context, writes } = makeIntegrationContext(repoDir, resticRepo);
+    await model.methods.prune.execute({}, context, effects);
+
+    assertEquals(writes.length, 1);
+    assertEquals(writes[0].specName, "pruneResult");
+
+    // record name: prune-2026-01-02T03-04-05
+    const expectedName = `prune-${FIXED_DATE.toISOString().replace(/[:.]/g, "-").slice(0, 19)}`;
+    assertEquals(
+      writes[0].instanceName,
+      expectedName,
+      `record name must use fixed-clock date: ${expectedName}`,
+    );
+  } finally {
+    await cleanup();
+  }
+});
+
+Deno.test("ISSUE-6-12/S2: restore.execute with fixed clock produces deterministic record name", async () => {
+  const FIXED_DATE = new Date("2026-01-02T03:04:05Z");
+  const effects: MethodEffects = { now: () => FIXED_DATE };
+  const { repoDir, resticRepo, cleanup } = await makeIntegrationRepo();
+  const stagingDir = await Deno.makeTempDir({ prefix: "swamp-i612-restore-stage-" });
+  try {
+    await makeFixtureSwampTree(repoDir);
+    const { context: initCtx } = makeIntegrationContext(repoDir, resticRepo);
+    await model.methods.init.execute({}, initCtx);
+
+    const { context: backupCtx } = makeIntegrationContext(repoDir, resticRepo);
+    await model.methods.backup.execute({ tags: [] }, backupCtx);
+
+    const { context, writes } = makeIntegrationContext(repoDir, resticRepo);
+    await model.methods.restore.execute(
+      { snapshot: "latest", targetDir: stagingDir, confirm: false },
+      context,
+      effects,
+    );
+
+    assertEquals(writes.length, 1);
+    assertEquals(writes[0].specName, "restoreResult");
+
+    // record name: restore-2026-01-02T03-04-05
+    const expectedName = `restore-${FIXED_DATE.toISOString().replace(/[:.]/g, "-").slice(0, 19)}`;
+    assertEquals(
+      writes[0].instanceName,
+      expectedName,
+      `record name must use fixed-clock date: ${expectedName}`,
+    );
+  } finally {
+    await cleanup();
+    await Deno.remove(stagingDir, { recursive: true });
+  }
+});
+
+Deno.test("ISSUE-6-12/S3: restore.execute with pinned cwd anchors .swamp/ boundary correctly", async () => {
+  // The effects.cwd seam lets tests pin the working directory used by
+  // resolveRestoreTarget, independently of Deno.cwd(). This test verifies:
+  //   (a) a target outside pinnedCwd/.swamp/ is accepted (safe), and
+  //   (b) a target inside pinnedCwd/.swamp/ is refused (dangerous) — proving
+  //       the seam drives the boundary even when repoDir is relative.
+  //
+  // Uses the real restic binary so runSecretPreflight succeeds normally;
+  // only the cwd seam is injected.
+  const { repoDir, resticRepo, cleanup } = await makeIntegrationRepo();
+  const stagingDir = await Deno.makeTempDir({ prefix: "swamp-i612-s3-stage-" });
+  try {
+    await makeFixtureSwampTree(repoDir);
+    const { context: initCtx } = makeIntegrationContext(repoDir, resticRepo);
+    await model.methods.init.execute({}, initCtx);
+
+    const { context: backupCtx } = makeIntegrationContext(repoDir, resticRepo);
+    await model.methods.backup.execute({ tags: [] }, backupCtx);
+
+    // CORR-1: prove the seam DRIVES the anchor. Use a RELATIVE repoDir (".")
+    // in globalArgs and pin effects.cwd to the real temp repo. resolveRestoreTarget
+    // then anchors ".swamp/" at effects.cwd()/repoDir, NOT the process cwd — so a
+    // relative target that resolves into the pinned repo's .swamp/ is refused, and
+    // a target elsewhere is accepted. If restore ignored effects.cwd and used
+    // Deno.cwd(), the relative-target boundary below would misfire.
+    const effects: MethodEffects = { cwd: () => repoDir };
+
+    // (a) an absolute staging dir outside the pinned repo — accepted
+    const { context: safeCtx, writes } = makeIntegrationContext(".", resticRepo, { });
+    await model.methods.restore.execute(
+      { snapshot: "latest", targetDir: stagingDir, confirm: false },
+      safeCtx,
+      effects,
+    );
+    assertEquals(writes.length, 1, "safe restore must produce exactly one write");
+    assertEquals(writes[0].specName, "restoreResult");
+
+    // (b) a target inside the pinned repo's .swamp/ — refused. repoDir in
+    // globalArgs is "." so the ONLY way this resolves into the real .swamp/ is
+    // via the injected effects.cwd anchor.
+    const dangerousTarget = `${repoDir}/.swamp/subdir`;
+    const { context: dangerCtx } = makeIntegrationContext(".", resticRepo, { });
+    const err = await assertRejects(
+      () => model.methods.restore.execute(
+        { snapshot: "latest", targetDir: dangerousTarget, confirm: false },
+        dangerCtx,
+        effects,
+      ),
+      Error,
+    );
+    assertStringIncludes(err.message, "Restore refused (dangerous target)");
+  } finally {
+    await cleanup();
+    await Deno.remove(stagingDir, { recursive: true });
+  }
 });

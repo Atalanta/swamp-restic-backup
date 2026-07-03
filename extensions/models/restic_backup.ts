@@ -31,7 +31,7 @@ import {
 } from "./_lib/path-safety.ts";
 import {
   parseResticJsonOutput,
-} from "./_lib/invoker.ts";
+} from "./_lib/decode.ts";
 
 import { checkRestic } from "./_lib/methods/check-restic.ts";
 import { init } from "./_lib/methods/init.ts";

@@ -3,7 +3,7 @@
  *
  * Pure path logic + Deno filesystem queries (lstat, realPath). No subprocess
  * invocation, no secrets. Importable by any module; imports nothing from
- * invoker.ts or secrets.ts.
+ * spawn.ts, commands.ts, or secrets.ts.
  *
  * POSIX-ONLY: this checker reasons about POSIX absolute paths (leading `/`,
  * `/`-separated segments). A non-POSIX absolute target — a Windows drive-letter
