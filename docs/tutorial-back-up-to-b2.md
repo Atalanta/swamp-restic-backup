@@ -40,6 +40,9 @@ safe before continuing:
 swamp vault put swamp-backup RESTIC_PASSWORD
 ```
 
+To use a cryptographically strong random value instead of a typed passphrase,
+see [How to generate the restic encryption password](how-to/generate-the-encryption-password.md).
+
 Check that all three are stored:
 
 ```
