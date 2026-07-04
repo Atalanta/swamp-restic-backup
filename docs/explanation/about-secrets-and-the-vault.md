@@ -26,7 +26,10 @@ A local encrypted vault backend keeps its own encrypted key material under
 `.swamp/secrets`. The default backup excludes that path, so vault material is
 never copied into the remote backup.
 
-The extension does not generate the encryption password; you choose it and store
-it with `swamp vault put`. This respects the two-secret split: swamp can
-generate a restic encryption password, which is its own to mint, but not the B2
-credentials, which belong to your Backblaze account.
+The encryption password is swamp's to mint: generate a strong random value and
+store it with `swamp vault put`, or choose your own. Either way the value goes
+only into the vault, never the model definition — see
+[How to generate the restic encryption password](../how-to/generate-the-encryption-password.md).
+This respects the two-secret split: the encryption password is swamp's to
+generate, but the B2 credentials are not — they belong to your Backblaze
+account, so you always supply those yourself.
