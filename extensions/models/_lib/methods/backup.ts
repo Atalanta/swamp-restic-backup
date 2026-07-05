@@ -96,10 +96,20 @@ export const backup = {
       host: context.globalArgs.hostTag ?? "",
     };
 
-    const handle = await context.writeResource(
+    // Write the result under a stable name for deterministic latest retrieval,
+    // and additionally under a snapshot-id-addressed name so a specific
+    // historical snapshot's backup record can be fetched by id. Both are the
+    // same spec and payload; swamp versions each independently.
+    const payload = backupData as unknown as Record<string, unknown>;
+    const latestHandle = await context.writeResource(
+      "backupResult",
+      "backup-latest",
+      payload,
+    );
+    const snapshotHandle = await context.writeResource(
       "backupResult",
       `backup-${snapshotId.slice(0, 12)}`,
-      backupData as unknown as Record<string, unknown>,
+      payload,
     );
 
     context.logger.info(
@@ -112,6 +122,6 @@ export const backup = {
       },
     );
 
-    return { dataHandles: [handle] };
+    return { dataHandles: [latestHandle, snapshotHandle] };
   },
 };

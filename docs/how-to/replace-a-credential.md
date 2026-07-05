@@ -15,11 +15,11 @@ Verify the new credential works with a non-destructive method:
 
 ```
 swamp model @atalanta/restic-backup/repository method run snapshots my-backup
-swamp data get my-backup current --json
+swamp data get my-backup snapshots-latest --json
 ```
 
-`snapshots` writes to `current`. A non-empty `content.snapshots` list confirms
-restic authenticated to B2 with the new credential.
+`snapshots` writes to `snapshots-latest`. A non-empty `content.snapshots` list
+confirms restic authenticated to B2 with the new credential.
 
 Changing `RESTIC_PASSWORD` is different. restic encrypts each repository with
 its password, so a new password does not open an existing repository. Set it

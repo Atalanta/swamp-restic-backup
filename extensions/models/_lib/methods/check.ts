@@ -75,7 +75,7 @@ export const check = {
 
     const handle = await context.writeResource(
       "checkResult",
-      `check-${now().toISOString().slice(0, 10)}`,
+      "check-latest",
       checkData as unknown as Record<string, unknown>,
     );
 

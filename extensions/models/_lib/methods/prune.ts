@@ -12,7 +12,6 @@ import { invokeResticPrune } from "../commands.ts";
 import { runSecretPreflight } from "../preflight.ts";
 import { redactSecrets } from "../secrets.ts";
 import type { MethodContext } from "../method-context.ts";
-import type { MethodEffects } from "../method-effects.ts";
 
 export const prune = {
   description:
@@ -21,10 +20,7 @@ export const prune = {
   execute: async (
     _args: z.infer<typeof PruneArgsSchema>,
     context: MethodContext,
-    effects: MethodEffects = {},
   ) => {
-    // Wall-clock injectable seam: production uses real Date, tests inject a fixed clock.
-    const now = effects.now ?? (() => new Date());
     const { secrets, cwd, resticPath, repository } = await runSecretPreflight(
       context.globalArgs,
     );
@@ -63,7 +59,7 @@ export const prune = {
 
     const handle = await context.writeResource(
       "pruneResult",
-      `prune-${now().toISOString().replace(/[:.]/g, "-").slice(0, 19)}`,
+      "prune-latest",
       pruneData as unknown as Record<string, unknown>,
     );
 

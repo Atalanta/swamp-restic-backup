@@ -25,12 +25,12 @@ effective set:
 swamp model @atalanta/restic-backup/repository method run backup my-backup --json
 ```
 
-`backup` writes a record named `backup-<snapshot id prefix>`, reported in the
-method output. Read it and check `content.includedPaths` and
-`content.excludedPatterns`:
+`backup` writes its result to the stable record `backup-latest` (and a copy
+addressed by snapshot id, `backup-<snapshot id prefix>`). Read the latest and
+check `content.includedPaths` and `content.excludedPatterns`:
 
 ```
-swamp data get my-backup backup-<snapshot id prefix> --json
+swamp data get my-backup backup-latest --json
 ```
 
 For the default sets these merge with, see

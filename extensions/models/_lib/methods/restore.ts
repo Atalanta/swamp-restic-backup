@@ -33,8 +33,6 @@ export const restore = {
     context: MethodContext,
     effects: MethodEffects = {},
   ) => {
-    // Wall-clock injectable seam: production uses real Date, tests inject a fixed clock.
-    const now = effects.now ?? (() => new Date());
     // cwdAnchor injectable seam: production uses Deno.cwd(), tests inject a fixed dir.
     // Only used for resolveRestoreTarget's cwdAnchor parameter — the subprocess cwd
     // comes from runSecretPreflight (repoDir) as before.
@@ -121,7 +119,7 @@ export const restore = {
 
     const handle = await context.writeResource(
       "restoreResult",
-      `restore-${now().toISOString().replace(/[:.]/g, "-").slice(0, 19)}`,
+      "restore-latest",
       restoreData as unknown as Record<string, unknown>,
     );
 

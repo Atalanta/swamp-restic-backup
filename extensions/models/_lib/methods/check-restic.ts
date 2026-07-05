@@ -37,7 +37,7 @@ export const checkRestic = {
 
     const handle = await context.writeResource(
       "resticStatus",
-      "current",
+      "restic-status",
       statusData as unknown as Record<string, unknown>,
     );
 
