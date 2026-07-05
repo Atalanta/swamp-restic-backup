@@ -8,11 +8,10 @@ repository, not one snapshot. Replace `my-backup` with your instance name:
 swamp model @atalanta/restic-backup/repository method run check my-backup --json
 ```
 
-`check` writes a dated record (`check-<YYYY-MM-DD>`), named in the method output.
-Read it:
+`check` writes its result to the stable record `check-latest`. Read the latest:
 
 ```
-swamp data get my-backup check-<YYYY-MM-DD> --json
+swamp data get my-backup check-latest --json
 ```
 
 `content.ok` must be `true` and `content.errors` must be empty. Treat a non-empty

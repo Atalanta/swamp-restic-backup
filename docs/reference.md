@@ -53,30 +53,54 @@ Excluded by default:
 
 ## Output resources
 
-Each method writes a versioned data record. The resource `spec` is fixed per
-method; the data record `name` varies. `checkRestic`, `init`, and `snapshots`
-all write to the record name `current`, so `current` holds whichever of those
-ran most recently — its `tags.specName` identifies which.
+Each method writes a versioned data record under a **stable, method-specific
+name**. Re-running a method adds a new version of that record; older versions
+remain until garbage-collected. `backup` additionally writes a
+snapshot-id-addressed record so a specific historical snapshot can be fetched by
+id.
 
 | Method | Spec | Data record name | Lifetime | GC versions |
 | --- | --- | --- | --- | --- |
-| `checkRestic` | `resticStatus` | `current` | 7d | 5 |
-| `init` | `repositoryStatus` | `current` | infinite | 10 |
-| `backup` | `backupResult` | `backup-<snapshotId[:12]>` | 90d | 100 |
-| `snapshots` | `snapshots` | `current` | 7d | 20 |
-| `check` | `checkResult` | `check-<YYYY-MM-DD>` | 30d | 30 |
-| `restore` | `restoreResult` | `restore-<timestamp>` | 30d | 20 |
-| `forget` | `forgetResult` | `forget-<timestamp>` | 90d | 50 |
-| `prune` | `pruneResult` | `prune-<timestamp>` | 90d | 50 |
+| `checkRestic` | `resticStatus` | `restic-status` | 7d | 5 |
+| `init` | `repositoryStatus` | `repository-status` | infinite | 10 |
+| `backup` | `backupResult` | `backup-latest` (+ `backup-<snapshotId[:12]>`) | 90d | 100 |
+| `snapshots` | `snapshots` | `snapshots-latest` | 7d | 20 |
+| `check` | `checkResult` | `check-latest` | 30d | 30 |
+| `restore` | `restoreResult` | `restore-latest` | 30d | 20 |
+| `forget` | `forgetResult` | `forget-latest` | 90d | 50 |
+| `prune` | `pruneResult` | `prune-latest` | 90d | 50 |
 
 ## Reading a result
 
-Query a result by its spec, projecting the fields you want:
+Read the latest result of a method by its stable name — this returns the most
+recent version:
 
 ```
-swamp data query 'modelName == "<instance>" && tags.specName == "<spec>"' \
-  --select '{"field": attributes.field}' --limit 1 --json
+swamp data get <instance> <record-name> --json
 ```
+
+For example, the latest backup and integrity-check results:
+
+```
+swamp data get my-backup backup-latest --json
+swamp data get my-backup check-latest --json
+```
+
+To read a specific historical backup by snapshot id, use the id-addressed
+record:
+
+```
+swamp data get my-backup backup-<snapshotId[:12]> --json
+```
+
+In a CEL expression, `data.latest("<instance>", "<record-name>")` resolves the
+same latest version. Earlier versions are reachable with
+`swamp data versions <instance> <record-name> --json`.
+
+Records written by an earlier version of this extension under the old names
+(`current`, `check-<date>`, `forget-<timestamp>`, and so on) are not migrated;
+they remain until they age out under garbage collection. New runs write only the
+stable names above.
 
 ## Methods
 

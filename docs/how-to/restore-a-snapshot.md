@@ -10,11 +10,11 @@ swamp model @atalanta/restic-backup/repository method run restore my-backup \
   --input snapshot=latest --input targetDir=/tmp/swamp-restore --json
 ```
 
-`restore` writes a timestamped record (`restore-<timestamp>`) named in the
-method output. Read it for the counts:
+`restore` writes its result to the stable record `restore-latest`. Read the
+latest for the counts:
 
 ```
-swamp data get my-backup restore-<timestamp> --json
+swamp data get my-backup restore-latest --json
 ```
 
 `content.filesRestored` and `content.bytesRestored` report what was written.

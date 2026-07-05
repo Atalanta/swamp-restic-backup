@@ -650,6 +650,7 @@ integrationTest("S3: check_restic uses --json (version command returns JSON)", a
     // If --json was NOT used, available would be false or throw a parse error
     assertEquals(writes.length, 1);
     assertEquals(writes[0].specName, "resticStatus");
+    assertEquals(writes[0].instanceName, "restic-status");
     assertEquals(writes[0].data.available, true);
     // Version must be parseable and non-empty
     assertStringIncludes(String(writes[0].data.version ?? ""), "0.");
@@ -1336,6 +1337,7 @@ integrationTest("S6: init — first call creates repository (created:true)", asy
 
     assertEquals(writes.length, 1);
     assertEquals(writes[0].specName, "repositoryStatus");
+    assertEquals(writes[0].instanceName, "repository-status");
     assertEquals(writes[0].data.created, true);
     assertEquals(writes[0].data.initialized, true);
     assertEquals(typeof writes[0].data.repository, "string");
@@ -1393,6 +1395,8 @@ integrationTest("S6: init — second call on initialized repo (initialized:true,
     await model.methods.init.execute({}, ctx2);
 
     assertEquals(writes2.length, 1);
+    assertEquals(writes2[0].specName, "repositoryStatus");
+    assertEquals(writes2[0].instanceName, "repository-status");
     assertEquals(writes2[0].data.initialized, true);
     assertEquals(writes2[0].data.created, false);
   } finally {
@@ -1412,8 +1416,27 @@ integrationTest("S7: backup — fixture .swamp/ tree → snapshotId, non-zero fi
     const { context: backupCtx, writes } = makeIntegrationContext(repoDir, resticRepo);
     await model.methods.backup.execute({ tags: ["test"] }, backupCtx);
 
-    assertEquals(writes.length, 1);
+    // backup writes TWICE: the stable name plus a snapshot-id-addressed copy.
+    assertEquals(writes.length, 2);
     assertEquals(writes[0].specName, "backupResult");
+    assertEquals(writes[1].specName, "backupResult");
+    // First write is the stable latest handle; second is the id-addressed copy.
+    assertEquals(
+      writes[0].instanceName,
+      "backup-latest",
+      "backup writes the stable record name backup-latest first",
+    );
+    assertMatch(
+      writes[1].instanceName,
+      /^backup-[0-9a-f]{12}$/,
+      "backup also writes a snapshot-id-addressed record backup-<snapshotId[:12]>",
+    );
+    // Both records carry the identical payload.
+    assertEquals(
+      JSON.stringify(writes[0].data),
+      JSON.stringify(writes[1].data),
+      "the stable and id-addressed backup records must hold the same payload",
+    );
     const result = writes[0].data;
 
     // Must have a non-empty snapshot ID
@@ -1525,6 +1548,7 @@ integrationTest("S5: snapshots — lists snapshots from integration backup", asy
 
     assertEquals(writes.length, 1);
     assertEquals(writes[0].specName, "snapshots");
+    assertEquals(writes[0].instanceName, "snapshots-latest");
     const result = writes[0].data;
 
     assertEquals((result.count as number) >= 1, true, "Must have at least 1 snapshot");
@@ -2871,6 +2895,7 @@ exit 0
 
     assertEquals(writes.length, 1);
     assertEquals(writes[0].specName, "snapshots");
+    assertEquals(writes[0].instanceName, "snapshots-latest");
     const result = writes[0].data;
 
     // The snapshot with time 10:00 (SNAP_A) is chronologically later.
@@ -4160,7 +4185,7 @@ Deno.test("ISSUE-6-12/S1: invokeResticBackup with fake SpawnEffect captures argv
   assertEquals(capturedClearEnv, false, "clearEnv must be false for invokeResticBackup");
 });
 
-integrationTest("ISSUE-6-12/S2: check.execute with fixed clock produces deterministic record name and checkedAt", async () => {
+integrationTest("ISSUE-6-12/S2: check.execute uses the fixed clock for checkedAt and the stable record name check-latest", async () => {
   const FIXED_DATE = new Date("2026-01-02T03:04:05Z");
   const effects: MethodEffects = { now: () => FIXED_DATE };
   const { repoDir, resticRepo, cleanup } = await makeIntegrationRepo();
@@ -4185,20 +4210,18 @@ integrationTest("ISSUE-6-12/S2: check.execute with fixed clock produces determin
       FIXED_DATE.toISOString(),
       "checkedAt must be the fixed-clock date",
     );
-    // record name must use the fixed date's date portion: check-2026-01-02
+    // record name is now a stable literal, independent of the clock
     assertEquals(
       writes[0].instanceName,
-      "check-2026-01-02",
-      "record name must use fixed-clock date: check-2026-01-02",
+      "check-latest",
+      "check writes the stable record name check-latest",
     );
   } finally {
     await cleanup();
   }
 });
 
-integrationTest("ISSUE-6-12/S2: forget.execute with fixed clock produces deterministic record name", async () => {
-  const FIXED_DATE = new Date("2026-01-02T03:04:05Z");
-  const effects: MethodEffects = { now: () => FIXED_DATE };
+integrationTest("ISSUE-2/S2: forget.execute writes the stable record name forget-latest", async () => {
   const { repoDir, resticRepo, cleanup } = await makeIntegrationRepo();
   try {
     await makeFixtureSwampTree(repoDir);
@@ -4209,26 +4232,21 @@ integrationTest("ISSUE-6-12/S2: forget.execute with fixed clock produces determi
     await model.methods.backup.execute({ tags: [] }, backupCtx);
 
     const { context, writes } = makeIntegrationContext(repoDir, resticRepo);
-    await model.methods.forget.execute({ keepLast: 1, dryRun: false }, context, effects);
+    await model.methods.forget.execute({ keepLast: 1, dryRun: false }, context);
 
     assertEquals(writes.length, 1);
     assertEquals(writes[0].specName, "forgetResult");
-
-    // record name: forget-2026-01-02T03-04-05 (ISO with : and . replaced by -, first 19 chars)
-    const expectedName = `forget-${FIXED_DATE.toISOString().replace(/[:.]/g, "-").slice(0, 19)}`;
     assertEquals(
       writes[0].instanceName,
-      expectedName,
-      `record name must use fixed-clock date: ${expectedName}`,
+      "forget-latest",
+      "forget writes the stable record name forget-latest",
     );
   } finally {
     await cleanup();
   }
 });
 
-integrationTest("ISSUE-6-12/S2: prune.execute with fixed clock produces deterministic record name", async () => {
-  const FIXED_DATE = new Date("2026-01-02T03:04:05Z");
-  const effects: MethodEffects = { now: () => FIXED_DATE };
+integrationTest("ISSUE-2/S2: prune.execute writes the stable record name prune-latest", async () => {
   const { repoDir, resticRepo, cleanup } = await makeIntegrationRepo();
   try {
     await makeFixtureSwampTree(repoDir);
@@ -4247,28 +4265,23 @@ integrationTest("ISSUE-6-12/S2: prune.execute with fixed clock produces determin
     await model.methods.forget.execute({ keepLast: 1, dryRun: false }, forgetCtx);
 
     const { context, writes } = makeIntegrationContext(repoDir, resticRepo);
-    await model.methods.prune.execute({}, context, effects);
+    await model.methods.prune.execute({}, context);
 
     assertEquals(writes.length, 1);
     assertEquals(writes[0].specName, "pruneResult");
-
-    // record name: prune-2026-01-02T03-04-05
-    const expectedName = `prune-${FIXED_DATE.toISOString().replace(/[:.]/g, "-").slice(0, 19)}`;
     assertEquals(
       writes[0].instanceName,
-      expectedName,
-      `record name must use fixed-clock date: ${expectedName}`,
+      "prune-latest",
+      "prune writes the stable record name prune-latest",
     );
   } finally {
     await cleanup();
   }
 });
 
-integrationTest("ISSUE-6-12/S2: restore.execute with fixed clock produces deterministic record name", async () => {
-  const FIXED_DATE = new Date("2026-01-02T03:04:05Z");
-  const effects: MethodEffects = { now: () => FIXED_DATE };
+integrationTest("ISSUE-2/S2: restore.execute writes the stable record name restore-latest", async () => {
   const { repoDir, resticRepo, cleanup } = await makeIntegrationRepo();
-  const stagingDir = await Deno.makeTempDir({ prefix: "swamp-i612-restore-stage-" });
+  const stagingDir = await Deno.makeTempDir({ prefix: "swamp-i2-restore-stage-" });
   try {
     await makeFixtureSwampTree(repoDir);
     const { context: initCtx } = makeIntegrationContext(repoDir, resticRepo);
@@ -4281,18 +4294,14 @@ integrationTest("ISSUE-6-12/S2: restore.execute with fixed clock produces determ
     await model.methods.restore.execute(
       { snapshot: "latest", targetDir: stagingDir, confirm: false },
       context,
-      effects,
     );
 
     assertEquals(writes.length, 1);
     assertEquals(writes[0].specName, "restoreResult");
-
-    // record name: restore-2026-01-02T03-04-05
-    const expectedName = `restore-${FIXED_DATE.toISOString().replace(/[:.]/g, "-").slice(0, 19)}`;
     assertEquals(
       writes[0].instanceName,
-      expectedName,
-      `record name must use fixed-clock date: ${expectedName}`,
+      "restore-latest",
+      "restore writes the stable record name restore-latest",
     );
   } finally {
     await cleanup();

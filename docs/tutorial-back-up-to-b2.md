@@ -93,17 +93,18 @@ how, see [About secrets and the vault](explanation/about-secrets-and-the-vault.m
 swamp model @atalanta/restic-backup/repository method run checkRestic my-backup
 ```
 
-`checkRestic` writes its result to the data record named `current`. Read it:
+`checkRestic` writes its result to the data record named `restic-status`. Read
+it:
 
 ```
-swamp data get my-backup current --json
+swamp data get my-backup restic-status --json
 ```
 
 The result payload sits under `content`:
 
 ```json
 {
-  "name": "current",
+  "name": "restic-status",
   "content": {
     "available": true,
     "version": "0.18.1",
@@ -120,14 +121,14 @@ We see `content.available` is `true`. If it is `false`, install restic or set
 
 ```
 swamp model @atalanta/restic-backup/repository method run init my-backup
-swamp data get my-backup current --json
+swamp data get my-backup repository-status --json
 ```
 
 The first run reports `created: true`:
 
 ```json
 {
-  "name": "current",
+  "name": "repository-status",
   "content": {
     "repository": "b2:<bucket>:<path>",
     "initialized": true,
@@ -146,21 +147,24 @@ once.
 swamp model @atalanta/restic-backup/repository method run backup my-backup --json
 ```
 
-Unlike the earlier methods, `backup` writes to a record named after the snapshot
-(`backup-<snapshot id prefix>`), not `current`. The method output reports the
-record it wrote under `dataArtifacts`:
+`backup` writes two records: the stable `backup-latest`, and a copy named after
+the snapshot (`backup-<snapshot id prefix>`) so a specific historical snapshot
+can be fetched by id. The method output reports both under `dataArtifacts`:
 
 ```json
 {
   "status": "succeeded",
-  "dataArtifacts": [{ "name": "backup-8da3bc6f9a08" }]
+  "dataArtifacts": [
+    { "name": "backup-latest" },
+    { "name": "backup-8da3bc6f9a08" }
+  ]
 }
 ```
 
-Read that record — substitute the name from your own output:
+Read the latest backup by its stable name:
 
 ```
-swamp data get my-backup backup-8da3bc6f9a08 --json
+swamp data get my-backup backup-latest --json
 ```
 
 ```json
@@ -187,15 +191,15 @@ Notice that `.swamp/secrets`, `.swamp/logs`, and the bundle caches are not in
 
 ```
 swamp model @atalanta/restic-backup/repository method run snapshots my-backup
-swamp data get my-backup current --json
+swamp data get my-backup snapshots-latest --json
 ```
 
-`snapshots` writes to `current`. The count and `latestSnapshotId` are under
-`content`:
+`snapshots` writes to `snapshots-latest`. The count and `latestSnapshotId` are
+under `content`:
 
 ```json
 {
-  "name": "current",
+  "name": "snapshots-latest",
   "content": {
     "count": 1,
     "latestSnapshotId": "8da3bc6f9a08..."
@@ -209,11 +213,10 @@ swamp data get my-backup current --json
 swamp model @atalanta/restic-backup/repository method run check my-backup --json
 ```
 
-Like `backup`, `check` writes a dated record (`check-<YYYY-MM-DD>`) named in the
-method output. Read it:
+`check` writes its result to the stable record `check-latest`. Read it:
 
 ```
-swamp data get my-backup check-2026-07-01 --json
+swamp data get my-backup check-latest --json
 ```
 
 ```json

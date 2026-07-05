@@ -77,7 +77,7 @@ export const snapshots = {
 
     const handle = await context.writeResource(
       "snapshots",
-      "current",
+      "snapshots-latest",
       snapshotsData as unknown as Record<string, unknown>,
     );
 

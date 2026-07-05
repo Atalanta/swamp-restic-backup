@@ -11,11 +11,11 @@ swamp model @atalanta/restic-backup/repository method run forget my-backup \
   --input keepLast=7 --input dryRun=true --json
 ```
 
-`forget` writes a timestamped record (`forget-<timestamp>`) named in the method
-output under `dataArtifacts`. Read that record:
+`forget` writes its result to the stable record `forget-latest`. Read the
+latest:
 
 ```
-swamp data get my-backup forget-<timestamp> --json
+swamp data get my-backup forget-latest --json
 ```
 
 Confirm `content.snapshotsRemoved` matches your expectation. If the dry run

@@ -46,7 +46,7 @@ export const init = {
       };
       const handle = await context.writeResource(
         "repositoryStatus",
-        "current",
+        "repository-status",
         statusData as unknown as Record<string, unknown>,
       );
       context.logger.info(
@@ -94,7 +94,7 @@ export const init = {
     const statusData = { repository, initialized, created, message };
     const handle = await context.writeResource(
       "repositoryStatus",
-      "current",
+      "repository-status",
       statusData as unknown as Record<string, unknown>,
     );
 
