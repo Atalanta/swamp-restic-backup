@@ -1395,6 +1395,8 @@ integrationTest("S6: init — second call on initialized repo (initialized:true,
     await model.methods.init.execute({}, ctx2);
 
     assertEquals(writes2.length, 1);
+    assertEquals(writes2[0].specName, "repositoryStatus");
+    assertEquals(writes2[0].instanceName, "repository-status");
     assertEquals(writes2[0].data.initialized, true);
     assertEquals(writes2[0].data.created, false);
   } finally {
